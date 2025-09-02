@@ -1,0 +1,4 @@
+requests
+pynvml
+psutil
+aptos-sdk
