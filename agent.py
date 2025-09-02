@@ -3,7 +3,7 @@ import asyncio
 import configparser
 import requests
 import pynvml
-import psutil  # We will now use this for CPU and RAM
+import psutil
 
 from aptos_sdk.account import Account
 from aptos_sdk.async_client import RestClient
@@ -18,7 +18,7 @@ logging.basicConfig(
     level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s"
 )
 
-AWS_METADATA_URL = "http://169.254.169.254/latest/meta-data/"  # correct link-local IP
+AWS_METADATA_URL = "http://169.254.169.254/latest/meta-data/"
 
 
 def get_aws_metadata():
@@ -55,7 +55,6 @@ def get_physical_metadata():
         except Exception:
             pass
 
-    # --- UPGRADED LOGIC: Get CPU and RAM specs ---
     cpu_cores = psutil.cpu_count(logical=True)
     ram_gb = round(psutil.virtual_memory().total / (1024**3))
     logging.info(f"Detected CPU Cores: {cpu_cores}, RAM: {ram_gb} GB")
@@ -92,48 +91,47 @@ async def main():
         logging.error("Failed to initialize Aptos account or client.", exc_info=True)
         return
 
-    # 3) Detect environment and build the correct payload for the V2 contract
+    # 3) Detect environment
     aws_info = get_aws_metadata()
 
+    # 4) Prepare the arguments for our single `list_machine` function
+    function_arguments = []
+
     if aws_info:
-        # --- PATH FOR CLOUD MACHINES ---
         instance_type = aws_info["instance_type"]
-        logging.info(f"Building payload for V2 cloud machine: {instance_type}")
+        log_message = f"Submitting list_machine for cloud instance '{instance_type}'..."
 
-        entry_func = EntryFunction.natural(
-            f"{contract_address}::marketplace",
-            "list_cloud_machine",  # <-- CALLS THE NEW, DEDICATED CLOUD FUNCTION
-            [],
-            [
-                TransactionArgument(instance_type, Serializer.str),
-                TransactionArgument(price_per_second, Serializer.u64),
-            ],
-        )
-        log_message = f"Submitting list_cloud_machine for '{instance_type}'..."
-
+        function_arguments = [
+            TransactionArgument(False, Serializer.bool),  # is_physical = false
+            TransactionArgument(instance_type, Serializer.str),
+            TransactionArgument(price_per_second, Serializer.u64),
+        ]
     else:
-        # --- PATH FOR PHYSICAL MACHINES ---
         physical_info = get_physical_metadata()
-        logging.info(f"Building payload for V2 physical machine: {physical_info}")
+        log_message = f"Submitting list_machine for physical machine '{physical_info['gpu_model']}'..."
 
-        entry_func = EntryFunction.natural(
-            f"{contract_address}::marketplace",
-            "list_physical_machine",  # <-- CALLS THE NEW, DEDICATED PHYSICAL FUNCTION
-            [],
-            [
-                TransactionArgument(physical_info["gpu_model"], Serializer.str),
-                TransactionArgument(physical_info["cpu_cores"], Serializer.u64),
-                TransactionArgument(physical_info["ram_gb"], Serializer.u64),
-                TransactionArgument(price_per_second, Serializer.u64),
-            ],
-        )
-        log_message = (
-            f"Submitting list_physical_machine for '{physical_info['gpu_model']}'..."
-        )
+        # Arguments for `list_machine(is_physical: bool, gpu_or_instance_type: string, ...)`
+        function_arguments = [
+            TransactionArgument(True, Serializer.bool),  # is_physical = true
+            TransactionArgument(physical_info["gpu_model"], Serializer.str),
+            TransactionArgument(price_per_second, Serializer.u64),
+        ]
 
+    # Add the host's public key as the final argument for BOTH paths
+    # (assuming your final contract requires it for signature verification)
+    pub_key_bytes = host_account.public_key().to_bytes()
+    function_arguments.append(TransactionArgument(pub_key_bytes, Serializer.to_bytes))
+
+    # 5) Construct the final EntryFunction and Payload
+    entry_func = EntryFunction.natural(
+        f"{contract_address}::marketplace",
+        "list_machine",  # <-- CALLS THE CORRECT, SINGLE FUNCTION
+        [],
+        function_arguments,
+    )
     payload = TransactionPayload(entry_func)
 
-    # 5) Sign, submit, wait (no changes here)
+    # 6) Sign, submit, wait
     try:
         logging.info(log_message)
         signed_txn = await rest_client.create_bcs_signed_transaction(
