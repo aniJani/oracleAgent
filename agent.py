@@ -13,6 +13,7 @@ import shutil
 import subprocess
 
 import docker
+import psutil  # REQUIRED: auto-detect CPU/RAM
 import pynvml
 import requests
 import websockets
@@ -35,6 +36,7 @@ logging.basicConfig(
 AWS_METADATA_URL = "http://169.254.169.254/latest/meta-data/"
 POLLING_INTERVAL_SECONDS = 15
 PAYMENT_CLAIM_INTERVAL_SECONDS = 60
+STATS_INTERVAL_SECONDS = 5  # how often to push GPU stats
 
 # Base image used for the notebook session
 PYTORCH_IMAGE = "pytorch/pytorch:2.8.0-cuda12.9-cudnn9-runtime"
@@ -65,6 +67,9 @@ class HostAgent:
         self.active_containers: Dict[int, str] = {}  # job_id -> container_id
         self.docker_client: Optional[docker.DockerClient] = None
         self.transaction_lock = asyncio.Lock()
+
+        # NEW: keep handles to background monitoring tasks
+        self.monitoring_tasks: Dict[int, asyncio.Task] = {}
 
         logging.info(f"Host Agent loaded for account: {self.host_account.address()}")
 
@@ -270,7 +275,114 @@ class HostAgent:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             return s.getsockname()[1]
 
-    def _start_container(self, job_id: int) -> Optional[Dict[str, Any]]:
+    # ---------- CPU/RAM + environment detection ----------
+    def _detect_cpu_ram(self) -> tuple[int, int]:
+        """
+        Returns (cpu_cores, ram_gb) using psutil (required).
+        Uses physical cores when available; falls back to logical.
+        """
+        # Cores: prefer physical, fallback to logical
+        cores = psutil.cpu_count(logical=False) or psutil.cpu_count(logical=True)
+        if not cores:
+            cores = os.cpu_count() or 1
+        # Memory total (bytes) -> GB
+        vm = psutil.virtual_memory()
+        ram_gb = int(round(vm.total / (1024**3)))
+        return int(max(1, cores)), int(max(1, ram_gb))
+
+    def detect_environment_and_specs(self) -> Dict[str, Any]:
+        """Detect cloud vs physical, GPU identifier, plus CPU/RAM (via psutil)."""
+        logging.info("🔎 Detecting environment and hardware specifications...")
+
+        # Always include CPU/RAM using psutil
+        cpu_cores, ram_gb = self._detect_cpu_ram()
+
+        # Check AWS first
+        try:
+            r = requests.get(f"{AWS_METADATA_URL}instance-type", timeout=1)
+            if r.status_code == 200:
+                return {
+                    "is_physical": False,
+                    "identifier": r.text,
+                    "cpu_cores": cpu_cores,
+                    "ram_gb": ram_gb,
+                }
+        except requests.exceptions.RequestException:
+            logging.info("   - Not an AWS environment. Assuming physical machine.")
+
+        # Physical GPU info
+        try:
+            pynvml.nvmlInit()
+            handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            gpu_model = pynvml.nvmlDeviceGetName(handle)
+            try:
+                gpu_model = gpu_model.decode("utf-8")  # NVML may return bytes
+            except Exception:
+                gpu_model = str(gpu_model)
+            logging.info(f"   - GPU Found: {gpu_model}")
+            pynvml.nvmlShutdown()
+            return {
+                "is_physical": True,
+                "identifier": gpu_model,
+                "cpu_cores": cpu_cores,
+                "ram_gb": ram_gb,
+            }
+        except pynvml.NVMLError:
+            logging.error("❌ Critical Error: Could not detect an NVIDIA GPU.")
+            sys.exit(1)
+
+    # ---------- Live stats monitoring ----------
+    async def _monitor_and_report_stats(self, job_id: int, websocket):
+        """
+        Background task: periodically reads GPU stats and sends them to backend.
+        """
+        logging.info(f"📊 Starting stats monitoring for Job ID: {job_id}")
+        try:
+            pynvml.nvmlInit()
+            handle = pynvml.nvmlDeviceGetHandleByIndex(0)  # single-GPU assumption
+            while job_id in self.active_containers:
+                try:
+                    mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
+                    util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+                    stats = {
+                        "gpu_utilization_percent": int(util.gpu),
+                        "memory_used_mb": int(mem.used // (1024**2)),
+                        "memory_total_mb": int(mem.total // (1024**2)),
+                    }
+                except pynvml.NVMLError as e:
+                    logging.error(f"NVML read error (job {job_id}): {e}")
+                    stats = None
+
+                try:
+                    await websocket.send(
+                        json.dumps(
+                            {
+                                "status": "stats_update",
+                                "job_id": job_id,
+                                "stats": stats,
+                            }
+                        )
+                    )
+                except websockets.exceptions.ConnectionClosed:
+                    logging.warning(
+                        f"WebSocket closed while monitoring job {job_id}. Stopping stats."
+                    )
+                    break
+
+                await asyncio.sleep(STATS_INTERVAL_SECONDS)
+        except pynvml.NVMLError as e:
+            logging.error(f"NVML init error while monitoring job {job_id}: {e}")
+        finally:
+            try:
+                pynvml.nvmlShutdown()
+            except Exception:
+                pass
+            # Ensure we clear our handle from the bookkeeping
+            self.monitoring_tasks.pop(job_id, None)
+            logging.info(f"⏹️ Stopped stats monitoring for Job ID: {job_id}")
+
+    # ---------- Container lifecycle ----------
+    def _start_container(self, job_id: int, websocket) -> Optional[Dict[str, Any]]:
         """Starts a Jupyter container and creates an ngrok tunnel to it."""
         logging.info(f"🚀 Starting container for job ID: {job_id}...")
         try:
@@ -332,6 +444,12 @@ class HostAgent:
             public_url = tunnel.public_url
             logging.info(f"✅ Secure tunnel created for job {job_id}: {public_url}")
 
+            # 5) Launch background GPU monitor
+            task = asyncio.create_task(
+                self._monitor_and_report_stats(job_id, websocket)
+            )
+            self.monitoring_tasks[job_id] = task
+
             return {"public_url": public_url, "token": token}
 
         except Exception as e:
@@ -343,8 +461,14 @@ class HostAgent:
             return None
 
     def _stop_container(self, job_id: int) -> None:
-        """Stops the ngrok tunnel and the container for a job if they exist."""
-        # Stop ngrok first
+        """Stops the monitor, ngrok tunnel, and the container for a job if they exist."""
+        # Cancel stats monitor first
+        mon = self.monitoring_tasks.pop(job_id, None)
+        if mon:
+            mon.cancel()
+            logging.info(f"📊 Canceled stats monitoring task for job {job_id}.")
+
+        # Stop ngrok
         tunnel = self.active_tunnels.pop(job_id, None)
         if tunnel:
             try:
@@ -368,27 +492,6 @@ class HostAgent:
                 logging.warning(f"Container stop warning: {e}")
 
     # ---------- Env/chain helpers ----------
-    def detect_environment_and_specs(self) -> Dict[str, Any]:
-        """Detect whether we are on AWS or a physical machine and gather an identifier."""
-        logging.info("🔎 Detecting environment and hardware specifications...")
-        try:
-            r = requests.get(f"{AWS_METADATA_URL}instance-type", timeout=1)
-            if r.status_code == 200:
-                return {"is_physical": False, "identifier": r.text}
-        except requests.exceptions.RequestException:
-            logging.info("   - Not an AWS environment. Assuming physical machine.")
-
-        try:
-            pynvml.nvmlInit()
-            handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-            gpu_model = pynvml.nvmlDeviceGetName(handle)
-            logging.info(f"   - GPU Found: {gpu_model}")
-            pynvml.nvmlShutdown()
-            return {"is_physical": True, "identifier": gpu_model}
-        except pynvml.NVMLError:
-            logging.error("❌ Critical Error: Could not detect an NVIDIA GPU.")
-            sys.exit(1)
-
     async def get_on_chain_listings(self) -> Dict[int, Any]:
         try:
             resource_type = f"{self.contract_address}::marketplace::ListingManager"
@@ -409,8 +512,8 @@ class HostAgent:
 
         if specs["is_physical"]:
             function_name = "list_physical_machine"
-            cpu_cores = 16
-            ram_gb = 32
+            cpu_cores = int(specs.get("cpu_cores", 1))
+            ram_gb = int(specs.get("ram_gb", 1))
             arguments = [
                 TransactionArgument(specs["identifier"], Serializer.str),  # gpu_model
                 TransactionArgument(cpu_cores, Serializer.u64),
@@ -616,7 +719,8 @@ class HostAgent:
                                 continue
 
                         if action == "start_session":
-                            details = self._start_container(job_id)
+                            # pass websocket so monitor can stream stats
+                            details = self._start_container(job_id, websocket)
                             resp = {
                                 "status": (
                                     "session_ready" if details else "session_error"
@@ -695,6 +799,7 @@ async def main():
         )
         return
 
+        # Optional: fail fast if psutil missing (it’s required now)
     agent = HostAgent(config)
     await agent.run()
 
