@@ -10,6 +10,7 @@ import json
 import websockets
 import socket
 from typing import Dict, Any, Set, Optional
+from pyngrok import ngrok, conf
 
 from aptos_sdk.account import Account
 from aptos_sdk.async_client import RestClient, ApiError
@@ -21,7 +22,9 @@ from aptos_sdk.transactions import (
 from aptos_sdk.bcs import Serializer
 
 # --- Setup ---
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s"
+)
 AWS_METADATA_URL = "http://169.254.169.254/latest/meta-data/"
 POLLING_INTERVAL_SECONDS = 15
 PAYMENT_CLAIM_INTERVAL_SECONDS = 60
@@ -31,10 +34,14 @@ DEFAULT_BACKEND_WS_URL = "ws://127.0.0.1:8000/ws"
 
 class HostAgent:
     def __init__(self, config: configparser.ConfigParser):
+        self.active_tunnels: Dict[int, Any] = {}
+        self._configure_ngrok(config)
         self.rest_client = RestClient(config["aptos"]["node_url"])
         self.host_account = Account.load_key(config["aptos"]["private_key"])
         self.contract_address = config["aptos"]["contract_address"]
-        self.backend_ws_url = config.get("aptos", "backend_ws_url", fallback=DEFAULT_BACKEND_WS_URL)
+        self.backend_ws_url = config.get(
+            "aptos", "backend_ws_url", fallback=DEFAULT_BACKEND_WS_URL
+        )
 
         self.price_per_second = int(config["host"]["price_per_second"])
         self.active_jobs: Set[int] = set()
@@ -46,6 +53,19 @@ class HostAgent:
 
         logging.info(f"Host Agent loaded for account: {self.host_account.address()}")
 
+
+    # ---------- ngrok helpers ----------
+    def _configure_ngrok(self, config: configparser.ConfigParser):
+    # allow env var fallback
+    auth = config.get("ngrok", "auth_token", fallback=os.getenv("NGROK_AUTHTOKEN", ""))
+    if not auth:
+        logging.error("❌ 'auth_token' missing in [ngrok] (or NGROK_AUTHTOKEN).")
+        sys.exit(1)
+    conf.get_default().auth_token = auth
+    # optional: pin region if needed, e.g. "us"
+    # conf.get_default().region = "us"
+    logging.info("✅ ngrok authtoken configured.")
+
     # ---------- Docker helpers ----------
 
     def _get_free_port(self) -> int:
@@ -55,65 +75,194 @@ class HostAgent:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             return s.getsockname()[1]
 
+    # def _start_container(self, job_id: int) -> Optional[Dict[str, Any]]:
+    #     """Starts the PyTorch Docker container and returns connection details."""
+    #     logging.info(f"🚀 Starting container for job ID: {job_id}...")
+    #     try:
+    #         if job_id in self.running_containers:
+    #             logging.warning(f"Container for job {job_id} is already running.")
+    #             return None
+
+    #         port = self._get_free_port()
+    #         token = f"unified-compute-token-{job_id}-{int(time.time()) % 10000}"
+
+    #         jupyter_command = (
+    #             "jupyter notebook --ip=0.0.0.0 --port=8888 --no-browser "
+    #             f"--allow-root --NotebookApp.token='{token}'"
+    #         )
+
+    #         # Try with runtime + device requests; fall back if daemon doesn't support runtime
+    #         try:
+    #             container = self.docker_client.containers.run(
+    #                 PYTORCH_IMAGE,
+    #                 command=jupyter_command,
+    #                 runtime="nvidia",
+    #                 detach=True,
+    #                 ports={"8888/tcp": port},
+    #                 device_requests=[
+    #                     docker.types.DeviceRequest(count=-1, capabilities=[["gpu"]])
+    #                 ],
+    #             )
+    #         except Exception:
+    #             container = self.docker_client.containers.run(
+    #                 PYTORCH_IMAGE,
+    #                 command=jupyter_command,
+    #                 detach=True,
+    #                 ports={"8888/tcp": port},
+    #                 device_requests=[
+    #                     docker.types.DeviceRequest(count=-1, capabilities=[["gpu"]])
+    #                 ],
+    #             )
+
+    #         self.running_containers[job_id] = container
+    #         logging.info(
+    #             f"✅ Container for job {job_id} started. Mapped host port: {port}"
+    #         )
+    #         return {"port": port, "token": token}
+    #     except Exception as e:
+    #         logging.error(
+    #             f"❌ Docker failed to start container for job {job_id}: {e}",
+    #             exc_info=True,
+    #         )
+    #         return None
+
+    # def _start_container(self, job_id: int) -> Optional[Dict[str, Any]]:
+    #     logging.info(f"🚀 Starting container for job ID: {job_id}...")
+    #     try:
+    #         if job_id in self.running_containers:
+    #             logging.warning(f"Container for job {job_id} is already running.")
+    #             return None
+
+    #         port = self._get_free_port()
+    #         token = f"unified-compute-token-{job_id}-{int(time.time()) % 10000}"
+
+    #         # Install jupyter inside the container, then launch it.
+    #         # Use `python -m` so we don't rely on a shell shim existing.
+    #         jupyter_command = (
+    #             "bash -lc "
+    #             '"python -m pip install --no-cache-dir --upgrade pip && '
+    #             "python -m pip install --no-cache-dir notebook jupyterlab && "
+    #             "python -m notebook --ip=0.0.0.0 --port=8888 --no-browser --allow-root "
+    #             f"--NotebookApp.token='{token}'\""
+    #         )
+
+    #         try:
+    #             container = self.docker_client.containers.run(
+    #                 PYTORCH_IMAGE,
+    #                 command=jupyter_command,
+    #                 runtime="nvidia",
+    #                 detach=True,
+    #                 ports={"8888/tcp": port},
+    #                 device_requests=[
+    #                     docker.types.DeviceRequest(count=-1, capabilities=[["gpu"]])
+    #                 ],
+    #             )
+    #         except Exception:
+    #             # Fallback if the daemon doesn't accept runtime="nvidia"
+    #             container = self.docker_client.containers.run(
+    #                 PYTORCH_IMAGE,
+    #                 command=jupyter_command,
+    #                 detach=True,
+    #                 ports={"8888/tcp": port},
+    #                 device_requests=[
+    #                     docker.types.DeviceRequest(count=-1, capabilities=[["gpu"]])
+    #                 ],
+    #             )
+    #         self.running_containers[job_id] = container
+    #         logging.info(
+    #             f"✅ Container for job {job_id} started. Mapped host port: {port}"
+    #         )
+    #         return {"port": port, "token": token}
+    #     except Exception as e:
+    #         logging.error(
+    #             f"❌ Docker failed to start container for job {job_id}: {e}",
+    #             exc_info=True,
+    #         )
+    #         return None
+
     def _start_container(self, job_id: int) -> Optional[Dict[str, Any]]:
-        """Starts the PyTorch Docker container and returns connection details."""
-        logging.info(f"🚀 Starting container for job ID: {job_id}...")
-        try:
-            if job_id in self.running_containers:
-                logging.warning(f"Container for job {job_id} is already running.")
-                return None
+    logging.info(f"🚀 Starting container for job ID: {job_id}...")
+    try:
+        # 1) choose a free HOST port and generate jupyter token
+        port = self._get_free_port()
+        token = f"unified-{job_id}-{int(time.time())%10000}"
 
-            port = self._get_free_port()
-            token = f"unified-compute-token-{job_id}-{int(time.time()) % 10000}"
+        # 2) run your Jupyter container mapped to that HOST port
+        #    (container_port is typically 8888)
+        container_port = 8888
+        image = self.jupyter_image  # wherever you store it
+        self._ensure_docker_client()
+        container = self.docker_client.containers.run(
+            image,
+            detach=True,
+            ports={f"{container_port}/tcp": port},  # host:container
+            environment={
+                "JUPYTER_TOKEN": token,
+                # OR for classic:
+                # "JUPYTER_ARGS": f"--ServerApp.token={token}"
+            },
+            # cmd/args as you already had
+            name=f"job-{job_id}-nb",
+            remove=True,
+        )
+        self.active_containers[job_id] = container.id
+        logging.info(f"✅ Container {container.id[:12]} on host port {port}")
 
-            jupyter_command = (
-                "jupyter notebook --ip=0.0.0.0 --port=8888 --no-browser "
-                f"--allow-root --NotebookApp.token='{token}'"
-            )
+        # 3) Create ngrok tunnel to the HOST port
+        logging.info(f"Creating secure tunnel for port {port}...")
+        tunnel = ngrok.connect(addr=port, proto="http")  # bind_tls by default
+        self.active_tunnels[job_id] = tunnel
+        public_url = tunnel.public_url
+        logging.info(f"✅ Secure tunnel created for job {job_id}: {public_url}")
 
-            # Try with runtime + device requests; fall back if daemon doesn't support runtime
-            try:
-                container = self.docker_client.containers.run(
-                    PYTORCH_IMAGE,
-                    command=jupyter_command,
-                    runtime="nvidia",
-                    detach=True,
-                    ports={"8888/tcp": port},
-                    device_requests=[docker.types.DeviceRequest(count=-1, capabilities=[["gpu"]])],
-                )
-            except Exception:
-                container = self.docker_client.containers.run(
-                    PYTORCH_IMAGE,
-                    command=jupyter_command,
-                    detach=True,
-                    ports={"8888/tcp": port},
-                    device_requests=[docker.types.DeviceRequest(count=-1, capabilities=[["gpu"]])],
-                )
+        # 4) Return secure URL + token
+        return {"public_url": public_url, "token": token}
 
-            self.running_containers[job_id] = container
-            logging.info(f"✅ Container for job {job_id} started. Mapped host port: {port}")
-            return {"port": port, "token": token}
-        except Exception as e:
-            logging.error(f"❌ Docker failed to start container for job {job_id}: {e}", exc_info=True)
-            return None
+    except Exception as e:
+        logging.error(f"❌ Failed to start container/tunnel for job {job_id}: {e}", exc_info=True)
+        self._stop_container(job_id)
+        return None
+    
+    # def _stop_container(self, job_id: int):
+    #     """Stops and removes the Docker container for a given job_id."""
+    #     logging.info(f"🛑 Stopping container for job ID: {job_id}...")
+    #     if job_id not in self.running_containers:
+    #         logging.warning(f"⚠️ No running container found for job {job_id} to stop.")
+    #         return
+    #     container = self.running_containers[job_id]
+    #     try:
+    #         container.stop()
+    #         container.remove()
+    #         logging.info(f"✅ Container for job {job_id} stopped and removed.")
+    #     except docker.errors.NotFound:
+    #         logging.warning(f"Container for job {job_id} was already removed.")
+    #     except Exception as e:
+    #         logging.error(
+    #             f"❌ Failed to stop/remove container for job {job_id}: {e}",
+    #             exc_info=True,
+    #         )
+    #     finally:
+    #         self.running_containers.pop(job_id, None)
 
     def _stop_container(self, job_id: int):
-        """Stops and removes the Docker container for a given job_id."""
-        logging.info(f"🛑 Stopping container for job ID: {job_id}...")
-        if job_id not in self.running_containers:
-            logging.warning(f"⚠️ No running container found for job {job_id} to stop.")
-            return
-        container = self.running_containers[job_id]
+    # stop ngrok first (harmless if missing)
+    tunnel = self.active_tunnels.pop(job_id, None)
+    if tunnel:
         try:
-            container.stop()
-            container.remove()
-            logging.info(f"✅ Container for job {job_id} stopped and removed.")
-        except docker.errors.NotFound:
-            logging.warning(f"Container for job {job_id} was already removed.")
+            logging.info(f"🛑 Disconnecting ngrok tunnel: {tunnel.public_url}")
+            ngrok.disconnect(tunnel.public_url)
         except Exception as e:
-            logging.error(f"❌ Failed to stop/remove container for job {job_id}: {e}", exc_info=True)
-        finally:
-            self.running_containers.pop(job_id, None)
+            logging.warning(f"ngrok disconnect warning: {e}")
+
+    # then stop/remove container (your existing logic)
+    cid = self.active_containers.pop(job_id, None)
+    if cid:
+        try:
+            c = self.docker_client.containers.get(cid)
+            logging.info(f"🛑 Stopping container {cid[:12]}")
+            c.stop(timeout=5)
+        except Exception as e:
+            logging.warning(f"Container stop warning: {e}")
 
     def ensure_docker(self):
         try:
@@ -136,7 +285,10 @@ class HostAgent:
                 self.docker_client.images.pull(PYTORCH_IMAGE)
                 logging.info("✅ Successfully pulled PyTorch base image.")
             except Exception as e:
-                logging.error(f"❌ Critical Error: Failed to pull Docker image: {e}", exc_info=True)
+                logging.error(
+                    f"❌ Critical Error: Failed to pull Docker image: {e}",
+                    exc_info=True,
+                )
                 sys.exit(1)
 
     # ---------- Env/chain helpers ----------
@@ -164,34 +316,86 @@ class HostAgent:
     async def get_on_chain_listings(self) -> Dict[int, Any]:
         try:
             resource_type = f"{self.contract_address}::marketplace::ListingManager"
-            response = await self.rest_client.account_resource(str(self.host_account.address()), resource_type)
+            response = await self.rest_client.account_resource(
+                str(self.host_account.address()), resource_type
+            )
             listings_data = response.get("data", {}).get("listings", [])
             return {int(l["id"]): l for l in listings_data}
         except Exception:
             return {}
 
-    async def register_on_chain_if_needed(self, specs: Dict[str, Any]):
-        if await self.get_on_chain_listings():
-            logging.info("Host already has listing(s) on-chain. Skipping registration.")
-            return
+    # async def register_on_chain_if_needed(self, specs: Dict[str, Any]):
+    #     if await self.get_on_chain_listings():
+    #         logging.info("Host already has listing(s) on-chain. Skipping registration.")
+    #         return
 
-        logging.info(f"🔗 No listings found. Registering '{specs['identifier']}' on the blockchain...")
+    #     logging.info(f"🔗 No listings found. Registering '{specs['identifier']}' on the blockchain...")
+
+    #     payload = TransactionPayload(
+    #         EntryFunction.natural(
+    #             f"{self.contract_address}::marketplace",
+    #             "list_machine",
+    #             [],
+    #             [
+    #                 TransactionArgument(specs["is_physical"], Serializer.bool),
+    #                 TransactionArgument(specs["identifier"], Serializer.str),
+    #                 TransactionArgument(self.price_per_second, Serializer.u64),
+    #                 # public key as bytes (vector<u8> on-chain)
+    #                 TransactionArgument(self.host_account.public_key().to_bytes(), Serializer.to_bytes),
+    #             ],
+    #         )
+    #     )
+    #     await self.submit_transaction(payload, f"✅ Successfully listed '{specs['identifier']}' on-chain!")
+
+    async def register_on_chain_if_needed(self, specs: Dict[str, Any]):
+
+        # --- DECISION LOGIC ---
+        if specs["is_physical"]:
+            # Call the function for physical machines
+            function_name = "list_physical_machine"
+            # Physical machine requires extra arguments
+            # You'll need to detect these in your detect_environment_and_specs
+            # For now, we can use placeholder values.
+            cpu_cores = 16
+            ram_gb = 32
+
+            arguments = [
+                TransactionArgument(specs["identifier"], Serializer.str),  # gpu_model
+                TransactionArgument(cpu_cores, Serializer.u64),
+                TransactionArgument(ram_gb, Serializer.u64),
+                TransactionArgument(self.price_per_second, Serializer.u64),
+                TransactionArgument(
+                    self.host_account.public_key().to_bytes(), Serializer.to_bytes
+                ),
+            ]
+        else:
+            # Call the function for cloud machines
+            function_name = "list_cloud_machine"
+            arguments = [
+                TransactionArgument(
+                    specs["identifier"], Serializer.str
+                ),  # instance_type
+                TransactionArgument(self.price_per_second, Serializer.u64),
+                TransactionArgument(
+                    self.host_account.public_key().to_bytes(), Serializer.to_bytes
+                ),
+            ]
+
+        logging.info(
+            f"🔗 Registering '{specs['identifier']}' on-chain using {function_name}..."
+        )
 
         payload = TransactionPayload(
             EntryFunction.natural(
                 f"{self.contract_address}::marketplace",
-                "list_machine",
+                function_name,  # Use the determined function name
                 [],
-                [
-                    TransactionArgument(specs["is_physical"], Serializer.bool),
-                    TransactionArgument(specs["identifier"], Serializer.str),
-                    TransactionArgument(self.price_per_second, Serializer.u64),
-                    # public key as bytes (vector<u8> on-chain)
-                    TransactionArgument(self.host_account.public_key().to_bytes(), Serializer.to_bytes),
-                ],
+                arguments,  # Use the correct arguments for that function
             )
         )
-        await self.submit_transaction(payload, f"✅ Successfully listed '{specs['identifier']}' on-chain!")
+        await self.submit_transaction(
+            payload, f"✅ Successfully listed '{specs['identifier']}' on-chain!"
+        )
 
     # ---------- Claim loop ----------
 
@@ -206,7 +410,9 @@ class HostAgent:
                     arguments=[str(job_id)],
                 )
                 parsed = json.loads(raw.decode("utf-8"))
-                logging.info(f"DEBUG: Parsed response from get_job for Job ID {job_id}: {parsed}")
+                logging.info(
+                    f"DEBUG: Parsed response from get_job for Job ID {job_id}: {parsed}"
+                )
                 if not parsed or not isinstance(parsed[0], dict):
                     logging.error("Unexpected data format from get_job.")
                     self.active_jobs.discard(job_id)
@@ -226,7 +432,9 @@ class HostAgent:
 
                 duration = max_end_time - start_time
                 if duration <= 0:
-                    logging.warning(f"Job {job_id} has non-positive duration; stopping.")
+                    logging.warning(
+                        f"Job {job_id} has non-positive duration; stopping."
+                    )
                     self.active_jobs.discard(job_id)
                     return
 
@@ -242,7 +450,9 @@ class HostAgent:
 
                 if accrued <= claimed_amount:
                     if claim_timestamp >= max_end_time:
-                        logging.info(f"Job {job_id}: fully claimed or at end; stopping claims.")
+                        logging.info(
+                            f"Job {job_id}: fully claimed or at end; stopping claims."
+                        )
                         self.active_jobs.discard(job_id)
                         return
                     logging.info(f"Job {job_id}: nothing new to claim yet.")
@@ -261,14 +471,21 @@ class HostAgent:
                         ],
                     )
                 )
-                await self.submit_transaction(payload, f"Successfully claimed payment for Job ID {job_id}")
+                await self.submit_transaction(
+                    payload, f"Successfully claimed payment for Job ID {job_id}"
+                )
 
             except ApiError as e:
-                logging.error(f"API Error claiming payment for Job ID {job_id}: {e}", exc_info=True)
+                logging.error(
+                    f"API Error claiming payment for Job ID {job_id}: {e}",
+                    exc_info=True,
+                )
                 self.active_jobs.discard(job_id)
                 return
             except Exception:
-                logging.error(f"Generic error claiming payment for Job ID {job_id}", exc_info=True)
+                logging.error(
+                    f"Generic error claiming payment for Job ID {job_id}", exc_info=True
+                )
                 self.active_jobs.discard(job_id)
                 return
 
@@ -283,7 +500,9 @@ class HostAgent:
         self.prepare_base_image()
         await self.register_on_chain_if_needed(specs)
 
-        logging.info("\n✅ Setup complete. Starting job polling and command listener...")
+        logging.info(
+            "\n✅ Setup complete. Starting job polling and command listener..."
+        )
 
         polling_task = asyncio.create_task(self.poll_for_jobs())
         command_listener_task = asyncio.create_task(self.listen_for_commands())
@@ -303,22 +522,32 @@ class HostAgent:
                             try:
                                 job_id = int(job_id_vec[0])
                             except Exception:
-                                logging.warning(f"Could not parse job_id from {job_id_vec}")
+                                logging.warning(
+                                    f"Could not parse job_id from {job_id_vec}"
+                                )
                                 continue
                             if job_id not in self.active_jobs:
-                                logging.info(f"🎉 New rental detected! Starting payment processor for Job ID: {job_id}")
+                                logging.info(
+                                    f"🎉 New rental detected! Starting payment processor for Job ID: {job_id}"
+                                )
                                 self.active_jobs.add(job_id)
                                 asyncio.create_task(self.claim_payment_for_job(job_id))
             except Exception as e:
-                logging.error(f"An error occurred during polling loop: {e}", exc_info=True)
+                logging.error(
+                    f"An error occurred during polling loop: {e}", exc_info=True
+                )
 
             await asyncio.sleep(POLLING_INTERVAL_SECONDS)
 
-    async def submit_transaction(self, payload: TransactionPayload, success_message: str):
+    async def submit_transaction(
+        self, payload: TransactionPayload, success_message: str
+    ):
         """Signs, submits and waits for a transaction; serialized to avoid seq# races."""
         async with self.transaction_lock:
             try:
-                signed_txn = await self.rest_client.create_bcs_signed_transaction(self.host_account, payload)
+                signed_txn = await self.rest_client.create_bcs_signed_transaction(
+                    self.host_account, payload
+                )
                 tx_hash = await self.rest_client.submit_bcs_transaction(signed_txn)
                 await self.rest_client.wait_for_transaction(tx_hash)
                 logging.info(f"{success_message} | Transaction: {tx_hash}")
@@ -341,7 +570,9 @@ class HostAgent:
                         try:
                             command = json.loads(message_raw)
                         except json.JSONDecodeError:
-                            logging.warning(f"Received non-JSON message: {message_raw!r}")
+                            logging.warning(
+                                f"Received non-JSON message: {message_raw!r}"
+                            )
                             continue
 
                         logging.info(f"⬇️ Received command from backend: {command}")
@@ -355,34 +586,51 @@ class HostAgent:
                             try:
                                 job_id = int(job_id)
                             except ValueError:
-                                logging.warning(f"Ignoring command with non-int job_id: {job_id!r}")
+                                logging.warning(
+                                    f"Ignoring command with non-int job_id: {job_id!r}"
+                                )
                                 continue
 
                         if action == "start_session":
                             details = self._start_container(job_id)
                             response = {
-                                "status": "session_ready" if details else "session_error",
+                                "status": (
+                                    "session_ready" if details else "session_error"
+                                ),
                                 "job_id": job_id,
                             }
                             if details:
-                                response.update({"port": details["port"], "token": details["token"]})
+                                response.update(
+                                    {"port": details["port"], "token": details["token"]}
+                                )
                             await websocket.send(json.dumps(response))
-                            logging.info(f"⬆️ Sent session details for job {job_id} to backend.")
+                            logging.info(
+                                f"⬆️ Sent session details for job {job_id} to backend."
+                            )
 
                         elif action == "stop_session":
                             self._stop_container(job_id)
                             response = {"status": "session_stopped", "job_id": job_id}
                             await websocket.send(json.dumps(response))
-                            logging.info(f"⬆️ Sent session stopped confirmation for job {job_id}.")
+                            logging.info(
+                                f"⬆️ Sent session stopped confirmation for job {job_id}."
+                            )
 
                         else:
                             logging.warning(f"Unknown action: {action}")
 
-            except (websockets.exceptions.ConnectionClosed, ConnectionRefusedError) as e:
-                logging.warning(f"⚠️ WebSocket connection issue: {e}. Retrying in 10 seconds...")
+            except (
+                websockets.exceptions.ConnectionClosed,
+                ConnectionRefusedError,
+            ) as e:
+                logging.warning(
+                    f"⚠️ WebSocket connection issue: {e}. Retrying in 10 seconds..."
+                )
                 await asyncio.sleep(10)
             except Exception as e:
-                logging.error(f"Unexpected error in WebSocket listener: {e}", exc_info=True)
+                logging.error(
+                    f"Unexpected error in WebSocket listener: {e}", exc_info=True
+                )
                 await asyncio.sleep(10)
 
 
@@ -396,7 +644,9 @@ async def main():
         _ = config["aptos"]["node_url"]
         _ = config["host"]["price_per_second"]
     except (KeyError, FileNotFoundError) as e:
-        logging.error(f"Configuration error in 'config.ini': {e}. Please ensure the file exists.")
+        logging.error(
+            f"Configuration error in 'config.ini': {e}. Please ensure the file exists."
+        )
         return
 
     agent = HostAgent(config)

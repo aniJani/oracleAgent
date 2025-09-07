@@ -4,3 +4,4 @@ psutil
 aptos-sdk
 docker
 websockets
+pyngrok
