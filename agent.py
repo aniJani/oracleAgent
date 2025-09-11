@@ -68,8 +68,11 @@ class HostAgent:
         self.docker_client: Optional[docker.DockerClient] = None
         self.transaction_lock = asyncio.Lock()
 
-        # NEW: keep handles to background monitoring tasks
+        # keep handles to background monitoring tasks
         self.monitoring_tasks: Dict[int, asyncio.Task] = {}
+
+        # NEW: track per-job session start timestamp (for final_session_duration)
+        self.session_start_times: Dict[int, float] = {}  # job_id -> start_timestamp
 
         logging.info(f"Host Agent loaded for account: {self.host_account.address()}")
 
@@ -444,7 +447,10 @@ class HostAgent:
             public_url = tunnel.public_url
             logging.info(f"✅ Secure tunnel created for job {job_id}: {public_url}")
 
-            # 5) Launch background GPU monitor
+            # 5) Record session start time (for final_session_duration)
+            self.session_start_times[job_id] = time.time()
+
+            # 6) Launch background GPU monitor
             task = asyncio.create_task(
                 self._monitor_and_report_stats(job_id, websocket)
             )
@@ -490,6 +496,9 @@ class HostAgent:
                 )
             except Exception as e:
                 logging.warning(f"Container stop warning: {e}")
+
+        # Clear recorded start time
+        self.session_start_times.pop(job_id, None)
 
     # ---------- Env/chain helpers ----------
     async def get_on_chain_listings(self) -> Dict[int, Any]:
@@ -607,6 +616,17 @@ class HostAgent:
                     await asyncio.sleep(PAYMENT_CLAIM_INTERVAL_SECONDS)
                     continue
 
+                # NEW: compute final_session_duration for the final claim, else 0
+                final_session_duration = 0
+                if claim_timestamp >= max_end_time:
+                    start_ts = self.session_start_times.get(job_id)
+                    if start_ts:
+                        final_session_duration = int(time.time() - start_ts)
+                    else:
+                        # Fallback if local tracking is missing
+                        final_session_duration = int(max_end_time - start_time)
+
+                # UPDATED ABI: claim_payment(host: &signer, job_id: u64, claim_timestamp: u64, final_session_duration: u64)
                 payload = TransactionPayload(
                     EntryFunction.natural(
                         f"{self.contract_address}::escrow",
@@ -615,6 +635,7 @@ class HostAgent:
                         [
                             TransactionArgument(job_id, Serializer.u64),
                             TransactionArgument(claim_timestamp, Serializer.u64),
+                            TransactionArgument(final_session_duration, Serializer.u64),
                         ],
                     )
                 )
