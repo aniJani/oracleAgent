@@ -68,10 +68,10 @@ class HostAgent:
         self.docker_client: Optional[docker.DockerClient] = None
         self.transaction_lock = asyncio.Lock()
 
-        # keep handles to background monitoring tasks
+        # background monitoring tasks
         self.monitoring_tasks: Dict[int, asyncio.Task] = {}
 
-        # NEW: track per-job session start timestamp (for final_session_duration)
+        # track per-job session start timestamp (for final_session_duration)
         self.session_start_times: Dict[int, float] = {}  # job_id -> start_timestamp
 
         logging.info(f"Host Agent loaded for account: {self.host_account.address()}")
@@ -79,16 +79,11 @@ class HostAgent:
     # ---------- helpers ----------
     @staticmethod
     def _looks_like_pyngrok_shim(path_str: str) -> bool:
-        """
-        Detect the pyngrok console-script shim on Windows (e.g., venv\\Scripts\\ngrok.exe).
-        We don't want to treat that as the real ngrok binary.
-        """
         if os.name != "nt":
             return False
         p = Path(path_str)
         try:
             scripts = p.parent
-            # Heuristic: in a Python venv/conda, Scripts contains python.exe
             return scripts.name.lower() == "scripts" and (
                 (scripts / "python.exe").exists()
                 or (scripts.parent / "python.exe").exists()
@@ -98,14 +93,6 @@ class HostAgent:
 
     # ---------- ngrok helpers ----------
     def _configure_ngrok(self, config: configparser.ConfigParser) -> None:
-        """
-        Robust ngrok resolution:
-        - Use [ngrok] path if it exists
-        - Else use a real ngrok found on PATH (ignore pyngrok shim)
-        - Else on Windows, try WinGet install
-        - Else fall back to pyngrok auto-download into a per-user folder (set TMP there)
-        """
-        # 1) Auth token
         auth_token = config.get(
             "ngrok", "auth_token", fallback=os.getenv("NGROK_AUTHTOKEN", "")
         )
@@ -114,7 +101,6 @@ class HostAgent:
             sys.exit(1)
         conf.get_default().auth_token = auth_token
 
-        # 2) Per-user folder for last-resort download
         if os.name == "nt":
             base = Path(os.getenv("LOCALAPPDATA") or Path.home())
             ngrok_dir = base / "UnifiedCompute" / "ngrok"
@@ -126,7 +112,6 @@ class HostAgent:
         per_user_bin = ngrok_dir / bin_name
         conf.get_default().config_path = str(ngrok_dir / "ngrok.yml")
 
-        # 3) Prefer explicit path if it exists
         explicit_path = config.get(
             "ngrok", "path", fallback=os.getenv("NGROK_PATH", "")
         )
@@ -135,7 +120,6 @@ class HostAgent:
             logging.info(f"✅ Using preinstalled ngrok at: {explicit_path}")
             return
 
-        # 4) Then PATH (but skip pyngrok shim)
         found = shutil.which("ngrok")
         if found and not self._looks_like_pyngrok_shim(found):
             conf.get_default().ngrok_path = found
@@ -144,7 +128,6 @@ class HostAgent:
         elif found:
             logging.info(f"ℹ️ Found pyngrok shim on PATH, ignoring: {found}")
 
-        # 5) Windows: try WinGet
         if os.name == "nt" and shutil.which("winget"):
             try:
                 logging.info("📦 Installing ngrok via WinGet (silent)...")
@@ -174,18 +157,13 @@ class HostAgent:
             except Exception as e:
                 logging.warning(f"WinGet install failed or unavailable: {e}")
 
-        # 6) Last resort: pyngrok downloader into per-user dir
         conf.get_default().ngrok_path = str(per_user_bin)
-
-        # Only now do we force TMP/TEMP into a safe folder for the download/unzip step
         os.environ["TMP"] = str(ngrok_dir)
         os.environ["TEMP"] = str(ngrok_dir)
         os.environ["TMPDIR"] = str(ngrok_dir)
-
         logging.info(f"ℹ️ Falling back to pyngrok auto-download into: {per_user_bin}")
 
     def _ngrok_preflight(self) -> None:
-        """Verify ngrok binary works; only install if no binary is present."""
         ngrok_bin = Path(conf.get_default().ngrok_path or "")
         try:
             if (
@@ -193,7 +171,6 @@ class HostAgent:
                 and ngrok_bin.exists()
                 and not self._looks_like_pyngrok_shim(str(ngrok_bin))
             ):
-                # Just verify it runs; don't trigger installer
                 proc = subprocess.run(
                     [str(ngrok_bin), "version"],
                     stdout=subprocess.PIPE,
@@ -212,15 +189,11 @@ class HostAgent:
                         f"stderr: {proc.stderr.strip()}"
                     )
 
-            # If no real binary yet, try to install into the configured path
             from pyngrok import installer
 
-            installer.install_ngrok(
-                conf.get_default().ngrok_path
-            )  # will download if needed
+            installer.install_ngrok(conf.get_default().ngrok_path)
             logging.info("✅ ngrok installed via pyngrok.")
 
-            # Re-verify
             proc = subprocess.run(
                 [str(conf.get_default().ngrok_path), "version"],
                 stdout=subprocess.PIPE,
@@ -242,7 +215,6 @@ class HostAgent:
 
     # ---------- Docker helpers ----------
     def ensure_docker(self) -> None:
-        """Initialize docker client and verify daemon is reachable."""
         try:
             self.docker_client = docker.from_env()
             self.docker_client.ping()
@@ -252,7 +224,6 @@ class HostAgent:
             sys.exit(1)
 
     def prepare_base_image(self) -> None:
-        """Pull the base image if not present."""
         if self.docker_client is None:
             raise RuntimeError("Docker client not initialized")
         logging.info(f"🐳 Checking for Docker image: {PYTORCH_IMAGE}...")
@@ -272,7 +243,6 @@ class HostAgent:
                 sys.exit(1)
 
     def _get_free_port(self) -> int:
-        """Ask OS for a free TCP port to avoid collisions."""
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.bind(("", 0))
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -280,27 +250,18 @@ class HostAgent:
 
     # ---------- CPU/RAM + environment detection ----------
     def _detect_cpu_ram(self) -> tuple[int, int]:
-        """
-        Returns (cpu_cores, ram_gb) using psutil (required).
-        Uses physical cores when available; falls back to logical.
-        """
-        # Cores: prefer physical, fallback to logical
         cores = psutil.cpu_count(logical=False) or psutil.cpu_count(logical=True)
         if not cores:
             cores = os.cpu_count() or 1
-        # Memory total (bytes) -> GB
         vm = psutil.virtual_memory()
         ram_gb = int(round(vm.total / (1024**3)))
         return int(max(1, cores)), int(max(1, ram_gb))
 
     def detect_environment_and_specs(self) -> Dict[str, Any]:
-        """Detect cloud vs physical, GPU identifier, plus CPU/RAM (via psutil)."""
         logging.info("🔎 Detecting environment and hardware specifications...")
 
-        # Always include CPU/RAM using psutil
         cpu_cores, ram_gb = self._detect_cpu_ram()
 
-        # Check AWS first
         try:
             r = requests.get(f"{AWS_METADATA_URL}instance-type", timeout=1)
             if r.status_code == 200:
@@ -313,13 +274,12 @@ class HostAgent:
         except requests.exceptions.RequestException:
             logging.info("   - Not an AWS environment. Assuming physical machine.")
 
-        # Physical GPU info
         try:
             pynvml.nvmlInit()
             handle = pynvml.nvmlDeviceGetHandleByIndex(0)
             gpu_model = pynvml.nvmlDeviceGetName(handle)
             try:
-                gpu_model = gpu_model.decode("utf-8")  # NVML may return bytes
+                gpu_model = gpu_model.decode("utf-8")
             except Exception:
                 gpu_model = str(gpu_model)
             logging.info(f"   - GPU Found: {gpu_model}")
@@ -336,13 +296,10 @@ class HostAgent:
 
     # ---------- Live stats monitoring ----------
     async def _monitor_and_report_stats(self, job_id: int, websocket):
-        """
-        Background task: periodically reads GPU stats and sends them to backend.
-        """
         logging.info(f"📊 Starting stats monitoring for Job ID: {job_id}")
         try:
             pynvml.nvmlInit()
-            handle = pynvml.nvmlDeviceGetHandleByIndex(0)  # single-GPU assumption
+            handle = pynvml.nvmlDeviceGetHandleByIndex(0)
             while job_id in self.active_containers:
                 try:
                     mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
@@ -380,13 +337,11 @@ class HostAgent:
                 pynvml.nvmlShutdown()
             except Exception:
                 pass
-            # Ensure we clear our handle from the bookkeeping
             self.monitoring_tasks.pop(job_id, None)
             logging.info(f"⏹️ Stopped stats monitoring for Job ID: {job_id}")
 
     # ---------- Container lifecycle ----------
     def _start_container(self, job_id: int, websocket) -> Optional[Dict[str, Any]]:
-        """Starts a Jupyter container and creates an ngrok tunnel to it."""
         logging.info(f"🚀 Starting container for job ID: {job_id}...")
         try:
             if job_id in self.active_containers:
@@ -396,11 +351,10 @@ class HostAgent:
             if self.docker_client is None:
                 raise RuntimeError("Docker client not initialized")
 
-            # 1) Choose free host port + generate a token
             host_port = self._get_free_port()
             token = f"unified-{job_id}-{int(time.time())%10000}"
 
-            # 2) Command: ensure notebook exists, then launch it
+            # Ensure Jupyter is available in the base image
             jupyter_command = (
                 "bash -lc "
                 '"python -m pip install --no-cache-dir --upgrade pip && '
@@ -408,7 +362,6 @@ class HostAgent:
                 f"python -m notebook --ip=0.0.0.0 --port=8888 --no-browser --allow-root --NotebookApp.token='{token}'\""
             )
 
-            # 3) Run the container (use GPU if present; fall back if runtime flag not supported)
             try:
                 container = self.docker_client.containers.run(
                     PYTORCH_IMAGE,
@@ -440,17 +393,17 @@ class HostAgent:
                 f"✅ Container {container.id[:12]} running on host port {host_port}"
             )
 
-            # 4) Create ngrok tunnel to the host port
+            # Secure tunnel
             logging.info(f"Creating secure tunnel for port {host_port}...")
-            tunnel = ngrok.connect(addr=host_port, proto="http")  # HTTPS by default
+            tunnel = ngrok.connect(addr=host_port, proto="http")
             self.active_tunnels[job_id] = tunnel
             public_url = tunnel.public_url
             logging.info(f"✅ Secure tunnel created for job {job_id}: {public_url}")
 
-            # 5) Record session start time (for final_session_duration)
+            # Session start time for duration reporting
             self.session_start_times[job_id] = time.time()
 
-            # 6) Launch background GPU monitor
+            # Launch background GPU monitor
             task = asyncio.create_task(
                 self._monitor_and_report_stats(job_id, websocket)
             )
@@ -467,14 +420,11 @@ class HostAgent:
             return None
 
     def _stop_container(self, job_id: int) -> None:
-        """Stops the monitor, ngrok tunnel, and the container for a job if they exist."""
-        # Cancel stats monitor first
         mon = self.monitoring_tasks.pop(job_id, None)
         if mon:
             mon.cancel()
             logging.info(f"📊 Canceled stats monitoring task for job {job_id}.")
 
-        # Stop ngrok
         tunnel = self.active_tunnels.pop(job_id, None)
         if tunnel:
             try:
@@ -483,7 +433,6 @@ class HostAgent:
             except Exception as e:
                 logging.warning(f"ngrok disconnect warning: {e}")
 
-        # Then stop/remove container
         container_id = self.active_containers.pop(job_id, None)
         if container_id and self.docker_client:
             try:
@@ -513,7 +462,6 @@ class HostAgent:
             return {}
 
     async def register_on_chain_if_needed(self, specs: Dict[str, Any]) -> None:
-        """Register host machine if nothing is listed yet."""
         existing = await self.get_on_chain_listings()
         if existing:
             logging.info("Host already has listing(s) on-chain. Skipping registration.")
@@ -616,32 +564,58 @@ class HostAgent:
                     await asyncio.sleep(PAYMENT_CLAIM_INTERVAL_SECONDS)
                     continue
 
-                # NEW: compute final_session_duration for the final claim, else 0
+                # Compute final_session_duration for the final claim, else 0
                 final_session_duration = 0
                 if claim_timestamp >= max_end_time:
                     start_ts = self.session_start_times.get(job_id)
                     if start_ts:
                         final_session_duration = int(time.time() - start_ts)
                     else:
-                        # Fallback if local tracking is missing
                         final_session_duration = int(max_end_time - start_time)
 
-                # UPDATED ABI: claim_payment(host: &signer, job_id: u64, claim_timestamp: u64, final_session_duration: u64)
-                payload = TransactionPayload(
-                    EntryFunction.natural(
-                        f"{self.contract_address}::escrow",
-                        "claim_payment",
-                        [],
-                        [
-                            TransactionArgument(job_id, Serializer.u64),
-                            TransactionArgument(claim_timestamp, Serializer.u64),
-                            TransactionArgument(final_session_duration, Serializer.u64),
-                        ],
+                # Prefer 3-arg ABI (Week 9+). If chain is older, retry with 2-arg ABI.
+                try:
+                    payload = TransactionPayload(
+                        EntryFunction.natural(
+                            f"{self.contract_address}::escrow",
+                            "claim_payment",
+                            [],
+                            [
+                                TransactionArgument(job_id, Serializer.u64),
+                                TransactionArgument(claim_timestamp, Serializer.u64),
+                                TransactionArgument(
+                                    final_session_duration, Serializer.u64
+                                ),
+                            ],
+                        )
                     )
-                )
-                await self.submit_transaction(
-                    payload, f"Successfully claimed payment for Job ID {job_id}"
-                )
+                    await self.submit_transaction(
+                        payload, f"Successfully claimed payment for Job ID {job_id}"
+                    )
+                except Exception as e:
+                    if "NUMBER_OF_ARGUMENTS_MISMATCH" in str(e):
+                        logging.warning(
+                            "Chain indicates older claim_payment ABI; retrying with 2 arguments."
+                        )
+                        payload2 = TransactionPayload(
+                            EntryFunction.natural(
+                                f"{self.contract_address}::escrow",
+                                "claim_payment",
+                                [],
+                                [
+                                    TransactionArgument(job_id, Serializer.u64),
+                                    TransactionArgument(
+                                        claim_timestamp, Serializer.u64
+                                    ),
+                                ],
+                            )
+                        )
+                        await self.submit_transaction(
+                            payload2,
+                            f"Successfully claimed payment (2-arg ABI) for Job ID {job_id}",
+                        )
+                    else:
+                        raise
 
             except ApiError as e:
                 logging.error(
@@ -677,7 +651,6 @@ class HostAgent:
                 raise
 
     async def poll_for_jobs(self) -> None:
-        """Polls on-chain listings and starts claimers for active jobs."""
         while True:
             logging.info("Polling for new rentals...")
             try:
@@ -707,7 +680,6 @@ class HostAgent:
             await asyncio.sleep(POLLING_INTERVAL_SECONDS)
 
     async def listen_for_commands(self) -> None:
-        """Connect to backend WS and handle start/stop session commands."""
         addr_str = str(self.host_account.address())
         uri = f"{self.backend_ws_url}/{addr_str}"
         while True:
@@ -740,7 +712,6 @@ class HostAgent:
                                 continue
 
                         if action == "start_session":
-                            # pass websocket so monitor can stream stats
                             details = self._start_container(job_id, websocket)
                             resp = {
                                 "status": (
@@ -749,7 +720,6 @@ class HostAgent:
                                 "job_id": job_id,
                             }
                             if details:
-                                # Send secure ngrok URL instead of raw IP/port
                                 resp.update(
                                     {
                                         "public_url": details["public_url"],
@@ -808,19 +778,16 @@ async def main():
     config = configparser.ConfigParser()
     try:
         config.read_file(open("config.ini"))
-        # Required keys sanity check
         _ = config["aptos"]["private_key"]
         _ = config["aptos"]["contract_address"]
         _ = config["aptos"]["node_url"]
         _ = config["host"]["price_per_second"]
-        # ngrok token is validated inside HostAgent.__init__
     except (KeyError, FileNotFoundError) as e:
         logging.error(
             f"Configuration error in 'config.ini': {e}. Please ensure the file exists and has required keys."
         )
         return
 
-        # Optional: fail fast if psutil missing (it’s required now)
     agent = HostAgent(config)
     await agent.run()
 
