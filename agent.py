@@ -27,6 +27,12 @@ from aptos_sdk.transactions import (
     TransactionArgument,
     TransactionPayload,
 )
+import atexit
+import signal
+from typing import Tuple
+
+STATE_FILE = "agent_state.json"
+CONTAINER_NAME_PREFIX = "uc-job-"
 
 # --- Logging / Constants ---
 logging.basicConfig(
@@ -42,6 +48,21 @@ STATS_INTERVAL_SECONDS = 5  # how often to push GPU stats
 PYTORCH_IMAGE = "pytorch/pytorch:2.8.0-cuda12.9-cudnn9-runtime"
 
 DEFAULT_BACKEND_WS_URL = "ws://127.0.0.1:8000/ws"
+
+
+# def _wait_for_jupyter(self, host_port: int, timeout: int = 180) -> bool:
+#     """Return True once Jupyter answers on localhost:host_port (any <500 code)."""
+#     url = f"http://127.0.0.1:{host_port}/"
+#     deadline = time.time() + timeout
+#     while time.time() < deadline:
+#         try:
+#             r = requests.get(url, timeout=2)
+#             if r.status_code < 500:
+#                 return True
+#         except requests.RequestException:
+#             pass
+#         time.sleep(1)
+#     return False
 
 
 class HostAgent:
@@ -74,7 +95,59 @@ class HostAgent:
         # track per-job session start timestamp (for final_session_duration)
         self.session_start_times: Dict[int, float] = {}  # job_id -> start_timestamp
 
+        # track per-job token so we can re-announce on resume
+        self._tokens: Dict[int, str] = {}
+
         logging.info(f"Host Agent loaded for account: {self.host_account.address()}")
+
+        # graceful shutdown hooks
+        atexit.register(self.shutdown)
+        try:
+            signal.signal(signal.SIGTERM, self._handle_signal)
+            signal.signal(signal.SIGINT, self._handle_signal)
+        except Exception:
+            # On some platforms/threads signals may not be settable; ignore.
+            pass
+
+    def _handle_signal(self, signum, frame):
+        logging.warning(
+            f"Received signal {getattr(signal, 'Signals', lambda x: x)(signum)}; shutting down…"
+        )
+        # atexit handler will run
+        try:
+            sys.exit(0)
+        except SystemExit:
+            pass
+
+    def shutdown(self):
+        """Best-effort cleanup. Safe to call multiple times."""
+        logging.info("🛑 Graceful shutdown: closing tunnels, stopping containers.")
+        # Stop monitors first
+        for job_id, task in list(self.monitoring_tasks.items()):
+            try:
+                task.cancel()
+            except Exception:
+                pass
+            self.monitoring_tasks.pop(job_id, None)
+
+        # Close tunnels
+        for job_id, tunnel in list(self.active_tunnels.items()):
+            try:
+                ngrok.disconnect(tunnel.public_url)
+            except Exception:
+                pass
+            self.active_tunnels.pop(job_id, None)
+
+        # Stop containers
+        for job_id in list(self.active_containers.keys()):
+            try:
+                self._stop_container(job_id)
+            except Exception:
+                pass
+
+        # Final save (should be empty if we stopped all)
+        self._save_state()
+        logging.info("✅ Shutdown complete.")
 
     # ---------- helpers ----------
     @staticmethod
@@ -248,6 +321,24 @@ class HostAgent:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             return s.getsockname()[1]
 
+    def _kill_and_remove_by_name(self, name: str) -> None:
+        """Stop and remove any container that already uses this name (prevents 409)."""
+        if self.docker_client is None:
+            return
+        try:
+            c = self.docker_client.containers.get(name)
+        except docker.errors.NotFound:
+            return
+        try:
+            try:
+                c.stop(timeout=5)
+            except Exception:
+                pass
+            c.remove(force=True)
+            logging.info(f"🧹 Removed stale container '{name}'.")
+        except Exception as e:
+            logging.warning(f"Could not remove stale container '{name}': {e}")
+
     # ---------- CPU/RAM + environment detection ----------
     def _detect_cpu_ram(self) -> tuple[int, int]:
         cores = psutil.cpu_count(logical=False) or psutil.cpu_count(logical=True)
@@ -353,6 +444,7 @@ class HostAgent:
 
             host_port = self._get_free_port()
             token = f"unified-{job_id}-{int(time.time())%10000}"
+            self._tokens[job_id] = token  # persist for resume
 
             # Ensure Jupyter is available in the base image
             jupyter_command = (
@@ -361,6 +453,10 @@ class HostAgent:
                 "python -m pip install --no-cache-dir notebook jupyterlab && "
                 f"python -m notebook --ip=0.0.0.0 --port=8888 --no-browser --allow-root --NotebookApp.token='{token}'\""
             )
+
+            name = f"{CONTAINER_NAME_PREFIX}{job_id}"
+            # Pre-clean any stale container with this name to avoid 409 Conflict
+            self._kill_and_remove_by_name(name)
 
             try:
                 container = self.docker_client.containers.run(
@@ -372,10 +468,12 @@ class HostAgent:
                     device_requests=[
                         docker.types.DeviceRequest(count=-1, capabilities=[["gpu"]])
                     ],
-                    name=f"job-{job_id}-nb",
-                    remove=True,
+                    name=name,
+                    remove=True,  # auto-remove on exit
+                    labels={"uc.job_id": str(job_id)},
                 )
             except Exception:
+                # fallback w/o runtime flag for hosts without nvidia runtime
                 container = self.docker_client.containers.run(
                     PYTORCH_IMAGE,
                     command=jupyter_command,
@@ -384,14 +482,19 @@ class HostAgent:
                     device_requests=[
                         docker.types.DeviceRequest(count=-1, capabilities=[["gpu"]])
                     ],
-                    name=f"job-{job_id}-nb",
+                    name=name,
                     remove=True,
+                    labels={"uc.job_id": str(job_id)},
                 )
 
             self.active_containers[job_id] = container.id
+            self.session_start_times[job_id] = time.time()
             logging.info(
                 f"✅ Container {container.id[:12]} running on host port {host_port}"
             )
+
+            # Save state ASAP (container + token + start time)
+            self._save_state()
 
             # Secure tunnel
             logging.info(f"Creating secure tunnel for port {host_port}...")
@@ -400,14 +503,14 @@ class HostAgent:
             public_url = tunnel.public_url
             logging.info(f"✅ Secure tunnel created for job {job_id}: {public_url}")
 
-            # Session start time for duration reporting
-            self.session_start_times[job_id] = time.time()
-
             # Launch background GPU monitor
             task = asyncio.create_task(
                 self._monitor_and_report_stats(job_id, websocket)
             )
             self.monitoring_tasks[job_id] = task
+
+            # Save state again (optional, keeps things fresh)
+            self._save_state()
 
             return {"public_url": public_url, "token": token}
 
@@ -420,11 +523,13 @@ class HostAgent:
             return None
 
     def _stop_container(self, job_id: int) -> None:
+        # Cancel stats monitor
         mon = self.monitoring_tasks.pop(job_id, None)
         if mon:
             mon.cancel()
             logging.info(f"📊 Canceled stats monitoring task for job {job_id}.")
 
+        # Close ngrok tunnel
         tunnel = self.active_tunnels.pop(job_id, None)
         if tunnel:
             try:
@@ -433,21 +538,190 @@ class HostAgent:
             except Exception as e:
                 logging.warning(f"ngrok disconnect warning: {e}")
 
+        # Stop and remove container
         container_id = self.active_containers.pop(job_id, None)
         if container_id and self.docker_client:
             try:
                 c = self.docker_client.containers.get(container_id)
-                logging.info(f"🛑 Stopping container {container_id[:12]}")
-                c.stop(timeout=5)
             except docker.errors.NotFound:
-                logging.warning(
-                    f"Container {container_id[:12]} not found (already removed)."
-                )
-            except Exception as e:
-                logging.warning(f"Container stop warning: {e}")
+                c = None
+            if c:
+                try:
+                    logging.info(f"🛑 Stopping container {container_id[:12]}")
+                    c.stop(timeout=5)
+                except Exception as e:
+                    logging.warning(f"Container stop warning: {e}")
+                # In case auto-remove didn't occur
+                try:
+                    c.remove(force=True)
+                    logging.info(f"🧹 Removed container {container_id[:12]}")
+                except docker.errors.NotFound:
+                    pass
+                except Exception as e:
+                    logging.warning(f"Container remove warning: {e}")
 
-        # Clear recorded start time
+        # Clear recorded start time & token
         self.session_start_times.pop(job_id, None)
+        self._tokens.pop(job_id, None)
+
+        # Persist new state
+        self._save_state()
+
+    # ---------- state helpers ----------
+    def _state_snapshot(self) -> dict:
+        """Builds a JSON-serializable snapshot of live sessions."""
+        sessions = {}
+        for job_id, container_id in self.active_containers.items():
+            sessions[str(job_id)] = {
+                "container_id": container_id,
+                "container_name": f"{CONTAINER_NAME_PREFIX}{job_id}",
+                "host_port": self._host_port_for_container(container_id) or None,
+                "token": self._tokens.get(job_id),
+                "session_start_time": self.session_start_times.get(job_id),
+            }
+        return {"sessions": sessions}
+
+    def _save_state(self) -> None:
+        """Writes current state to disk."""
+        try:
+            with open(STATE_FILE, "w", encoding="utf-8") as f:
+                json.dump(self._state_snapshot(), f)
+            logging.info(f"💾 State saved to {STATE_FILE}")
+        except Exception as e:
+            logging.error(f"Failed to save state: {e}", exc_info=True)
+
+    def _load_state(self) -> dict:
+        if not os.path.exists(STATE_FILE):
+            logging.info("💾 No previous state file. Starting fresh.")
+            return {"sessions": {}}
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            logging.info(f"💾 Loaded state from {STATE_FILE}")
+            return data or {"sessions": {}}
+        except Exception as e:
+            logging.error(f"Failed to read state file: {e}", exc_info=True)
+            return {"sessions": {}}
+
+    def _host_port_for_container(self, container_id: str) -> Optional[int]:
+        try:
+            c = self.docker_client.containers.get(container_id)
+            c.reload()  # ensure attrs are fresh
+            ports = (c.attrs or {}).get("NetworkSettings", {}).get("Ports", {})
+            bindings = ports.get("8888/tcp") or []
+            if bindings:
+                return int(bindings[0].get("HostPort"))
+        except Exception:
+            pass
+        return None
+
+    def _load_and_prepare_resumes(self) -> None:
+        """
+        Load state file and populate self._resumable_sessions with sessions we can
+        re-attach to (container exists). We will finalize resume after WS connects.
+        """
+        self._resumable_sessions: Dict[int, dict] = {}  # job_id -> info
+
+        state = self._load_state()
+        sessions = state.get("sessions", {})
+
+        for job_id_str, s in sessions.items():
+            try:
+                job_id = int(job_id_str)
+            except ValueError:
+                continue
+
+            container_id = s.get("container_id")
+            container_name = (
+                s.get("container_name") or f"{CONTAINER_NAME_PREFIX}{job_id}"
+            )
+            token = s.get("token")
+            start_ts = s.get("session_start_time")
+
+            # Prefer look-up by id; fallback to name
+            container = None
+            try:
+                if container_id:
+                    container = self.docker_client.containers.get(container_id)
+            except Exception:
+                container = None
+
+            if container is None:
+                # try by name (covers rename/schema changes)
+                try:
+                    container = self.docker_client.containers.get(container_name)
+                except Exception:
+                    container = None
+
+            if not container:
+                logging.info(
+                    f"⚠️ No live container found for job {job_id}; skipping resume."
+                )
+                continue
+
+            host_port = self._host_port_for_container(container.id)
+            if not host_port:
+                logging.info(
+                    f"⚠️ Could not detect host port for job {job_id}; skipping resume."
+                )
+                continue
+
+            # Track as active and mark to finish after WS connects
+            self.active_containers[job_id] = container.id
+            if token:
+                self._tokens[job_id] = token
+            if start_ts:
+                self.session_start_times[job_id] = start_ts
+
+            self._resumable_sessions[job_id] = {
+                "container_id": container.id,
+                "host_port": host_port,
+                "token": token,
+                "session_start_time": start_ts,
+            }
+            logging.info(
+                f"🔁 Will resume session for job {job_id} on port {host_port}."
+            )
+
+    async def _resume_all_sessions_over_ws(self, websocket):
+        """
+        Called right after a WS connection is established.
+        Recreate tunnels, restart monitors, and re-emit session_ready.
+        """
+        for job_id, info in list(self._resumable_sessions.items()):
+            host_port = info["host_port"]
+            token = info.get("token")
+            try:
+                tunnel = ngrok.connect(addr=host_port, proto="http")
+                self.active_tunnels[job_id] = tunnel
+                public_url = tunnel.public_url
+
+                # restart monitor
+                task = asyncio.create_task(
+                    self._monitor_and_report_stats(job_id, websocket)
+                )
+                self.monitoring_tasks[job_id] = task
+
+                # re-emit session_ready so backend fills SESSION_CACHE
+                msg = {
+                    "status": "session_ready",
+                    "job_id": job_id,
+                    "public_url": public_url,
+                    "token": token,
+                }
+                await websocket.send(json.dumps(msg))
+                logging.info(
+                    f"🔁 Re-announced session_ready for job {job_id} ({public_url})"
+                )
+
+                # remove from resumables
+                self._resumable_sessions.pop(job_id, None)
+
+                # Persist (optional, no public_url persisted)
+                self._save_state()
+
+            except Exception as e:
+                logging.error(f"Failed to resume job {job_id}: {e}", exc_info=True)
 
     # ---------- Env/chain helpers ----------
     async def get_on_chain_listings(self) -> Dict[int, Any]:
@@ -535,6 +809,8 @@ class HostAgent:
                 if not is_active:
                     logging.info(f"Job {job_id} is inactive; stopping claims.")
                     self.active_jobs.discard(job_id)
+                    # also stop any leftover session if still running
+                    self._stop_container(job_id)
                     return
 
                 duration = max_end_time - start_time
@@ -543,6 +819,7 @@ class HostAgent:
                         f"Job {job_id} has non-positive duration; stopping."
                     )
                     self.active_jobs.discard(job_id)
+                    self._stop_container(job_id)
                     return
 
                 now = int(time.time())
@@ -558,6 +835,7 @@ class HostAgent:
                         logging.info(
                             f"Job {job_id}: fully claimed or at end; stopping claims."
                         )
+                        self._stop_container(job_id)  # ensure deletion at job end
                         self.active_jobs.discard(job_id)
                         return
                     logging.info(f"Job {job_id}: nothing new to claim yet.")
@@ -617,17 +895,28 @@ class HostAgent:
                     else:
                         raise
 
+                # If we just made the final claim, stop session & exit loop
+                if claim_timestamp >= max_end_time:
+                    logging.info(
+                        f"Job {job_id}: final claim submitted; stopping session."
+                    )
+                    self._stop_container(job_id)
+                    self.active_jobs.discard(job_id)
+                    return
+
             except ApiError as e:
                 logging.error(
                     f"API Error claiming payment for Job ID {job_id}: {e}",
                     exc_info=True,
                 )
+                self._stop_container(job_id)
                 self.active_jobs.discard(job_id)
                 return
             except Exception:
                 logging.error(
                     f"Generic error claiming payment for Job ID {job_id}", exc_info=True
                 )
+                self._stop_container(job_id)
                 self.active_jobs.discard(job_id)
                 return
 
@@ -682,10 +971,15 @@ class HostAgent:
     async def listen_for_commands(self) -> None:
         addr_str = str(self.host_account.address())
         uri = f"{self.backend_ws_url}/{addr_str}"
+        backoff = 3
         while True:
             try:
                 async with websockets.connect(uri) as websocket:
                     logging.info(f"✅ WebSocket connected to backend at {uri}")
+                    # On each (re)connect, re-announce any resumable sessions
+                    await self._resume_all_sessions_over_ws(websocket)
+                    backoff = 3  # reset backoff
+
                     while True:
                         message_raw = await websocket.recv()
                         try:
@@ -744,21 +1038,29 @@ class HostAgent:
 
             except (
                 websockets.exceptions.ConnectionClosed,
+                websockets.exceptions.ConnectionClosedError,
                 ConnectionRefusedError,
+                OSError,
             ) as e:
                 logging.warning(
-                    f"⚠️ WebSocket connection issue: {e}. Retrying in 10 seconds..."
+                    f"⚠️ WebSocket connection issue: {e}. Retrying in {backoff} seconds..."
                 )
-                await asyncio.sleep(10)
             except Exception as e:
                 logging.error(
                     f"Unexpected error in WebSocket listener: {e}", exc_info=True
                 )
-                await asyncio.sleep(10)
+
+            # jittered exponential backoff
+            await asyncio.sleep(backoff)
+            backoff = min(30, int(backoff * 1.7) + 1)
 
     async def run(self) -> None:
         logging.info("--- 🚀 Starting Unified Compute Host Agent ---")
         self.ensure_docker()
+
+        # Load persisted sessions and mark them resumable BEFORE anything else
+        self._load_and_prepare_resumes()
+
         specs = self.detect_environment_and_specs()
         self.prepare_base_image()
         await self.register_on_chain_if_needed(specs)
