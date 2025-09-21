@@ -11,6 +11,9 @@ from typing import Any, Dict, Optional, Set
 
 import shutil
 import subprocess
+import secrets
+import re
+from urllib.parse import quote
 
 import docker
 import psutil  # REQUIRED: auto-detect CPU/RAM
@@ -29,7 +32,6 @@ from aptos_sdk.transactions import (
 )
 import atexit
 import signal
-from typing import Tuple
 
 STATE_FILE = "agent_state.json"
 CONTAINER_NAME_PREFIX = "uc-job-"
@@ -49,28 +51,65 @@ PYTORCH_IMAGE = "pytorch/pytorch:2.8.0-cuda12.9-cudnn9-runtime"
 
 DEFAULT_BACKEND_WS_URL = "ws://127.0.0.1:8000/ws"
 
+# Default Cloudflared path for Windows (yours). Can be overridden by config or env.
+DEFAULT_CLOUDFLARED_PATH = r"C:\Program Files (x86)\cloudflared\cloudflared.exe"
 
-# def _wait_for_jupyter(self, host_port: int, timeout: int = 180) -> bool:
-#     """Return True once Jupyter answers on localhost:host_port (any <500 code)."""
-#     url = f"http://127.0.0.1:{host_port}/"
-#     deadline = time.time() + timeout
-#     while time.time() < deadline:
-#         try:
-#             r = requests.get(url, timeout=2)
-#             if r.status_code < 500:
-#                 return True
-#         except requests.RequestException:
-#             pass
-#         time.sleep(1)
-#     return False
+#####################################################################
+# Key points:
+# - Prefer Cloudflare Quick Tunnels. Use explicit path if provided.
+# - Only fall back to ngrok if cloudflared isn't available anywhere.
+# - Wait for Jupyter locally BEFORE exposing public tunnel.
+# - Randomize Jupyter base_url; keep token-based auth.
+# - Raise shm_size to 1g to reduce kernel crashes.
+#####################################################################
+
+
+def _with_basic_auth(url: str, user: str, pwd: str) -> str:
+    """Embed basic-auth credentials into a URL (scheme://user:pwd@host/path)."""
+    scheme_sep = "://"
+    if scheme_sep not in url:
+        return url
+    scheme, rest = url.split(scheme_sep, 1)
+    return f"{scheme}{scheme_sep}{quote(user)}:{quote(pwd)}@{rest}"
 
 
 class HostAgent:
     def __init__(self, config: configparser.ConfigParser):
-        # --- ngrok (secure tunnel) ---
-        self.active_tunnels: Dict[int, Any] = {}
-        self._configure_ngrok(config)
-        self._ngrok_preflight()
+        # --- tunnel provider selection ---
+        self.tunnel_provider = (
+            config.get(
+                "tunnel",
+                "provider",
+                fallback=os.getenv("TUNNEL_PROVIDER", "cloudflare"),
+            )
+            .strip()
+            .lower()
+        )
+
+        # Resolve cloudflared path preference:
+        explicit_cf = config.get(
+            "tunnel",
+            "cloudflared_path",
+            fallback=os.getenv("CLOUDFLARED_PATH", DEFAULT_CLOUDFLARED_PATH),
+        ).strip()
+        self.cloudflared_path: Optional[str] = explicit_cf if explicit_cf else None
+        if self.cloudflared_path and not Path(self.cloudflared_path).exists():
+            # If explicit path missing, try PATH lookup
+            found = shutil.which("cloudflared")
+            if found:
+                self.cloudflared_path = found
+            else:
+                self.cloudflared_path = None
+
+        # Runtime tunnel registry (per job_id)
+        # For cloudflare: {"provider":"cloudflare","proc":Popen,"public_url":str}
+        # For ngrok:      {"provider":"ngrok","tunnel":NgrokTunnel,"public_url":str}
+        self.active_tunnels: Dict[int, Dict[str, Any]] = {}
+
+        # Configure ngrok only if chosen or needed as fallback later
+        if self.tunnel_provider == "ngrok":
+            self._configure_ngrok(config)
+            self._ngrok_preflight()
 
         # --- Chain / backend ---
         self.rest_client = RestClient(config["aptos"]["node_url"])
@@ -98,6 +137,9 @@ class HostAgent:
         # track per-job token so we can re-announce on resume
         self._tokens: Dict[int, str] = {}
 
+        # track per-job Jupyter base_url prefix (for resume)
+        self._base_prefix: Dict[int, str] = {}
+
         logging.info(f"Host Agent loaded for account: {self.host_account.address()}")
 
         # graceful shutdown hooks
@@ -106,14 +148,22 @@ class HostAgent:
             signal.signal(signal.SIGTERM, self._handle_signal)
             signal.signal(signal.SIGINT, self._handle_signal)
         except Exception:
-            # On some platforms/threads signals may not be settable; ignore.
             pass
 
+        # Auto-fallback to ngrok if Cloudflare was requested but unavailable
+        if self.tunnel_provider == "cloudflare" and not self._cloudflared_available():
+            logging.warning("cloudflared not available; falling back to ngrok.")
+            self.tunnel_provider = "ngrok"
+            self._configure_ngrok(config)
+            self._ngrok_preflight()
+        elif self.tunnel_provider == "cloudflare":
+            logging.info(f"✅ Using cloudflared at: {self.cloudflared_path}")
+
+    # ---------- signal / shutdown ----------
     def _handle_signal(self, signum, frame):
         logging.warning(
             f"Received signal {getattr(signal, 'Signals', lambda x: x)(signum)}; shutting down…"
         )
-        # atexit handler will run
         try:
             sys.exit(0)
         except SystemExit:
@@ -131,12 +181,24 @@ class HostAgent:
             self.monitoring_tasks.pop(job_id, None)
 
         # Close tunnels
-        for job_id, tunnel in list(self.active_tunnels.items()):
+        for job_id, t in list(self.active_tunnels.items()):
             try:
-                ngrok.disconnect(tunnel.public_url)
-            except Exception:
-                pass
-            self.active_tunnels.pop(job_id, None)
+                if t.get("provider") == "cloudflare":
+                    try:
+                        proc = t.get("proc")
+                        if proc and proc.poll() is None:
+                            proc.terminate()
+                    except Exception:
+                        pass
+                elif t.get("provider") == "ngrok":
+                    try:
+                        url = t.get("public_url")
+                        if url:
+                            ngrok.disconnect(url)
+                    except Exception:
+                        pass
+            finally:
+                self.active_tunnels.pop(job_id, None)
 
         # Stop containers
         for job_id in list(self.active_containers.keys()):
@@ -163,6 +225,93 @@ class HostAgent:
             )
         except Exception:
             return False
+
+    # Local readiness probe for Jupyter
+    def _wait_for_jupyter(self, host_port: int, timeout: int = 240) -> bool:
+        """
+        Poll http://127.0.0.1:<host_port>/ until Jupyter responds (<500).
+        Probe locally (not via tunnel) to avoid public RPM limits.
+        """
+        url = f"http://127.0.0.1:{host_port}/"
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                r = requests.get(url, timeout=2)
+                if r.status_code < 500:
+                    return True
+            except requests.RequestException:
+                pass
+            time.sleep(1)
+        return False
+
+    # ---------- cloudflared helpers ----------
+    def _cloudflared_available(self) -> bool:
+        return bool(
+            (self.cloudflared_path and Path(self.cloudflared_path).exists())
+            or shutil.which("cloudflared")
+        )
+
+    def _start_cloudflared(self, host_port: int) -> tuple[str, subprocess.Popen]:
+        """
+        Start a Cloudflare quick tunnel to http://127.0.0.1:<host_port>.
+        Returns (public_url, process). Raises on failure.
+        """
+        bin_path = (
+            self.cloudflared_path
+            if (self.cloudflared_path and Path(self.cloudflared_path).exists())
+            else "cloudflared"
+        )
+        cmd = [
+            bin_path,
+            "tunnel",
+            "--no-autoupdate",
+            "--url",
+            f"http://127.0.0.1:{host_port}",
+            "--loglevel",
+            "info",
+        ]
+        logging.info(
+            f"Starting cloudflared: {cmd[0]} tunnel --url http://127.0.0.1:{host_port}"
+        )
+
+        creationflags = (
+            subprocess.CREATE_NO_WINDOW
+            if os.name == "nt" and hasattr(subprocess, "CREATE_NO_WINDOW")
+            else 0
+        )
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            creationflags=creationflags,
+        )
+
+        deadline = time.time() + 30
+        url = None
+        pattern = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com", re.I)
+
+        # Read lines until the URL appears or we time out
+        if proc.stdout:
+            while time.time() < deadline and proc.poll() is None:
+                line = proc.stdout.readline()
+                if not line:
+                    time.sleep(0.05)
+                    continue
+                m = pattern.search(line)
+                if m:
+                    url = m.group(0)
+                    break
+
+        if not url:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            raise RuntimeError("cloudflared did not output a public URL in time")
+
+        return url, proc
 
     # ---------- ngrok helpers ----------
     def _configure_ngrok(self, config: configparser.ConfigParser) -> None:
@@ -282,7 +431,7 @@ class HostAgent:
         except Exception as e:
             logging.error(f"❌ ngrok preflight failed: {e}", exc_info=True)
             logging.error(
-                "If this is a locked-down network, set [ngrok] path to an existing ngrok.exe."
+                "If this is a locked-down network, set [ngrok] path to an existing ngrok binary."
             )
             sys.exit(1)
 
@@ -446,12 +595,22 @@ class HostAgent:
             token = f"unified-{job_id}-{int(time.time())%10000}"
             self._tokens[job_id] = token  # persist for resume
 
-            # Ensure Jupyter is available in the base image
+            # Per-job Jupyter base path (randomized)
+            base_prefix = f"/{secrets.token_urlsafe(8)}/"
+            self._base_prefix[job_id] = base_prefix
+
+            # If using ngrok, generate per-job edge basic auth
+            edge_user = "uc"
+            edge_pass = secrets.token_urlsafe(24)
+
+            # Launch Classic Notebook with token + base_url
             jupyter_command = (
                 "bash -lc "
                 '"python -m pip install --no-cache-dir --upgrade pip && '
-                "python -m pip install --no-cache-dir notebook jupyterlab && "
-                f"python -m notebook --ip=0.0.0.0 --port=8888 --no-browser --allow-root --NotebookApp.token='{token}'\""
+                "python -m pip install --no-cache-dir notebook jupyter_server ipykernel && "
+                f"python -m notebook --ip=0.0.0.0 --port=8888 --no-browser --allow-root "
+                f"--NotebookApp.base_url='{base_prefix}' "
+                f"--NotebookApp.token='{token}'\""
             )
 
             name = f"{CONTAINER_NAME_PREFIX}{job_id}"
@@ -471,6 +630,7 @@ class HostAgent:
                     name=name,
                     remove=True,  # auto-remove on exit
                     labels={"uc.job_id": str(job_id)},
+                    shm_size="1g",  # prevents first-kernel OOM/crash
                 )
             except Exception:
                 # fallback w/o runtime flag for hosts without nvidia runtime
@@ -485,6 +645,7 @@ class HostAgent:
                     name=name,
                     remove=True,
                     labels={"uc.job_id": str(job_id)},
+                    shm_size="1g",
                 )
 
             self.active_containers[job_id] = container.id
@@ -493,15 +654,50 @@ class HostAgent:
                 f"✅ Container {container.id[:12]} running on host port {host_port}"
             )
 
-            # Save state ASAP (container + token + start time)
+            # Save state ASAP
             self._save_state()
 
-            # Secure tunnel
-            logging.info(f"Creating secure tunnel for port {host_port}...")
-            tunnel = ngrok.connect(addr=host_port, proto="http")
-            self.active_tunnels[job_id] = tunnel
-            public_url = tunnel.public_url
-            logging.info(f"✅ Secure tunnel created for job {job_id}: {public_url}")
+            # Wait for Jupyter to actually be up before exposing
+            logging.info(
+                f"⏳ Waiting for Jupyter to come up on http://127.0.0.1:{host_port} ..."
+            )
+            if not self._wait_for_jupyter(host_port, timeout=240):
+                logging.warning(
+                    f"Jupyter on port {host_port} did not become ready within timeout. "
+                    f"Not creating tunnel; stopping container so the client can retry later."
+                )
+                self._stop_container(job_id)
+                return None
+
+            logging.info(f"✅ Jupyter is up on {host_port}. Creating tunnel…")
+
+            # Create public tunnel based on provider
+            if self.tunnel_provider == "cloudflare":
+                public_base, proc = self._start_cloudflared(host_port)
+                public_url = public_base.rstrip("/") + base_prefix
+                self.active_tunnels[job_id] = {
+                    "provider": "cloudflare",
+                    "proc": proc,
+                    "public_url": public_url,
+                }
+            else:
+                tunnel = ngrok.connect(
+                    addr=host_port,
+                    proto="http",
+                    auth=f"{edge_user}:{edge_pass}",
+                    inspect=False,
+                )
+                public_url = tunnel.public_url.rstrip("/") + base_prefix
+                public_url = _with_basic_auth(public_url, edge_user, edge_pass)
+                self.active_tunnels[job_id] = {
+                    "provider": "ngrok",
+                    "tunnel": tunnel,
+                    "public_url": public_url,
+                }
+
+            logging.info(
+                f"✅ Secure tunnel created for job {job_id}: {self.active_tunnels[job_id]['public_url']}"
+            )
 
             # Launch background GPU monitor
             task = asyncio.create_task(
@@ -509,7 +705,7 @@ class HostAgent:
             )
             self.monitoring_tasks[job_id] = task
 
-            # Save state again (optional, keeps things fresh)
+            # Save state again (optional)
             self._save_state()
 
             return {"public_url": public_url, "token": token}
@@ -529,14 +725,28 @@ class HostAgent:
             mon.cancel()
             logging.info(f"📊 Canceled stats monitoring task for job {job_id}.")
 
-        # Close ngrok tunnel
-        tunnel = self.active_tunnels.pop(job_id, None)
-        if tunnel:
+        # Close tunnel
+        t = self.active_tunnels.pop(job_id, None)
+        if t:
             try:
-                logging.info(f"🛑 Disconnecting ngrok tunnel: {tunnel.public_url}")
-                ngrok.disconnect(tunnel.public_url)
+                if t.get("provider") == "cloudflare":
+                    logging.info("🛑 Terminating cloudflared tunnel process.")
+                    try:
+                        proc = t.get("proc")
+                        if proc and proc.poll() is None:
+                            proc.terminate()
+                    except Exception as e:
+                        logging.warning(f"cloudflared terminate warning: {e}")
+                elif t.get("provider") == "ngrok":
+                    url = t.get("public_url")
+                    if url:
+                        logging.info(f"🛑 Disconnecting ngrok tunnel: {url}")
+                        try:
+                            ngrok.disconnect(url)
+                        except Exception as e:
+                            logging.warning(f"ngrok disconnect warning: {e}")
             except Exception as e:
-                logging.warning(f"ngrok disconnect warning: {e}")
+                logging.warning(f"Tunnel cleanup warning: {e}")
 
         # Stop and remove container
         container_id = self.active_containers.pop(job_id, None)
@@ -551,7 +761,6 @@ class HostAgent:
                     c.stop(timeout=5)
                 except Exception as e:
                     logging.warning(f"Container stop warning: {e}")
-                # In case auto-remove didn't occur
                 try:
                     c.remove(force=True)
                     logging.info(f"🧹 Removed container {container_id[:12]}")
@@ -560,9 +769,10 @@ class HostAgent:
                 except Exception as e:
                     logging.warning(f"Container remove warning: {e}")
 
-        # Clear recorded start time & token
+        # Clear recorded start time, token, and base prefix
         self.session_start_times.pop(job_id, None)
         self._tokens.pop(job_id, None)
+        self._base_prefix.pop(job_id, None)
 
         # Persist new state
         self._save_state()
@@ -578,6 +788,7 @@ class HostAgent:
                 "host_port": self._host_port_for_container(container_id) or None,
                 "token": self._tokens.get(job_id),
                 "session_start_time": self.session_start_times.get(job_id),
+                "base_prefix": self._base_prefix.get(job_id),
             }
         return {"sessions": sessions}
 
@@ -620,7 +831,7 @@ class HostAgent:
         Load state file and populate self._resumable_sessions with sessions we can
         re-attach to (container exists). We will finalize resume after WS connects.
         """
-        self._resumable_sessions: Dict[int, dict] = {}  # job_id -> info
+        self._resumable_sessions: Dict[int, dict] = {}
 
         state = self._load_state()
         sessions = state.get("sessions", {})
@@ -637,6 +848,7 @@ class HostAgent:
             )
             token = s.get("token")
             start_ts = s.get("session_start_time")
+            base_prefix = s.get("base_prefix") or "/"
 
             # Prefer look-up by id; fallback to name
             container = None
@@ -647,7 +859,6 @@ class HostAgent:
                 container = None
 
             if container is None:
-                # try by name (covers rename/schema changes)
                 try:
                     container = self.docker_client.containers.get(container_name)
                 except Exception:
@@ -672,12 +883,15 @@ class HostAgent:
                 self._tokens[job_id] = token
             if start_ts:
                 self.session_start_times[job_id] = start_ts
+            if base_prefix:
+                self._base_prefix[job_id] = base_prefix
 
             self._resumable_sessions[job_id] = {
                 "container_id": container.id,
                 "host_port": host_port,
                 "token": token,
                 "session_start_time": start_ts,
+                "base_prefix": base_prefix,
             }
             logging.info(
                 f"🔁 Will resume session for job {job_id} on port {host_port}."
@@ -691,10 +905,42 @@ class HostAgent:
         for job_id, info in list(self._resumable_sessions.items()):
             host_port = info["host_port"]
             token = info.get("token")
+            base_prefix = (
+                self._base_prefix.get(job_id) or info.get("base_prefix") or "/"
+            )
             try:
-                tunnel = ngrok.connect(addr=host_port, proto="http")
-                self.active_tunnels[job_id] = tunnel
-                public_url = tunnel.public_url
+                # Make sure Jupyter is responding before exposing/resuming
+                if not self._wait_for_jupyter(host_port, timeout=60):
+                    logging.warning(
+                        f"[resume] Jupyter on port {host_port} not ready; skipping tunnel for job {job_id}."
+                    )
+                    continue
+
+                # Recreate tunnel
+                if self.tunnel_provider == "cloudflare":
+                    public_base, proc = self._start_cloudflared(host_port)
+                    public_url = public_base.rstrip("/") + base_prefix
+                    self.active_tunnels[job_id] = {
+                        "provider": "cloudflare",
+                        "proc": proc,
+                        "public_url": public_url,
+                    }
+                else:
+                    edge_user = "uc"
+                    edge_pass = secrets.token_urlsafe(24)
+                    tunnel = ngrok.connect(
+                        addr=host_port,
+                        proto="http",
+                        auth=f"{edge_user}:{edge_pass}",
+                        inspect=False,
+                    )
+                    public_url = tunnel.public_url.rstrip("/") + base_prefix
+                    public_url = _with_basic_auth(public_url, edge_user, edge_pass)
+                    self.active_tunnels[job_id] = {
+                        "provider": "ngrok",
+                        "tunnel": tunnel,
+                        "public_url": public_url,
+                    }
 
                 # restart monitor
                 task = asyncio.create_task(
@@ -726,7 +972,7 @@ class HostAgent:
     # ---------- Env/chain helpers ----------
     async def get_on_chain_listings(self) -> Dict[int, Any]:
         try:
-            resource_type = f"{self.contract_address}::marketplace::ListingManager"
+            resource_type = f"{self.contract_address}::marketplace::ListingManager}}"
             response = await self.rest_client.account_resource(
                 str(self.host_account.address()), resource_type
             )
@@ -809,7 +1055,6 @@ class HostAgent:
                 if not is_active:
                     logging.info(f"Job {job_id} is inactive; stopping claims.")
                     self.active_jobs.discard(job_id)
-                    # also stop any leftover session if still running
                     self._stop_container(job_id)
                     return
 
@@ -835,7 +1080,7 @@ class HostAgent:
                         logging.info(
                             f"Job {job_id}: fully claimed or at end; stopping claims."
                         )
-                        self._stop_container(job_id)  # ensure deletion at job end
+                        self._stop_container(job_id)
                         self.active_jobs.discard(job_id)
                         return
                     logging.info(f"Job {job_id}: nothing new to claim yet.")
@@ -895,7 +1140,6 @@ class HostAgent:
                     else:
                         raise
 
-                # If we just made the final claim, stop session & exit loop
                 if claim_timestamp >= max_end_time:
                     logging.info(
                         f"Job {job_id}: final claim submitted; stopping session."
@@ -1084,6 +1328,9 @@ async def main():
         _ = config["aptos"]["contract_address"]
         _ = config["aptos"]["node_url"]
         _ = config["host"]["price_per_second"]
+        # Optional: [tunnel] provider=cloudflare|ngrok
+        # Optional: [tunnel] cloudflared_path=C:\Program Files (x86)\cloudflared\cloudflared.exe
+        # Optional: [ngrok]  auth_token=...
     except (KeyError, FileNotFoundError) as e:
         logging.error(
             f"Configuration error in 'config.ini': {e}. Please ensure the file exists and has required keys."
