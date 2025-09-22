@@ -1,26 +1,19 @@
-from pathlib import Path
 import asyncio
+import atexit
 import configparser
 import json
 import logging
 import os
-import socket
-import sys
+import secrets
+import signal
 import time
+import sys
 from typing import Any, Dict, Optional, Set
 
-import shutil
-import subprocess
-import secrets
-import re
-from urllib.parse import quote
-
 import docker
-import psutil  # REQUIRED: auto-detect CPU/RAM
-import pynvml
+import psutil
 import requests
 import websockets
-from pyngrok import conf, ngrok
 
 from aptos_sdk.account import Account
 from aptos_sdk.async_client import ApiError, RestClient
@@ -30,29 +23,22 @@ from aptos_sdk.transactions import (
     TransactionArgument,
     TransactionPayload,
 )
-import atexit
-import signal
 
-STATE_FILE = "agent_state.json"
-CONTAINER_NAME_PREFIX = "uc-job-"
-
-# --- Logging / Constants ---
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s"
+from constants import (
+    AWS_METADATA_URL,
+    PAYMENT_CLAIM_INTERVAL_SECONDS,
+    POLLING_INTERVAL_SECONDS,
+    DEFAULT_BACKEND_WS_URL,
+    STATE_FILE,
+    CONTAINER_NAME_PREFIX,
+    PYTORCH_IMAGE,
+    STATS_INTERVAL_SECONDS,
 )
-
-AWS_METADATA_URL = "http://169.254.169.254/latest/meta-data/"
-POLLING_INTERVAL_SECONDS = 15
-PAYMENT_CLAIM_INTERVAL_SECONDS = 60
-STATS_INTERVAL_SECONDS = 5  # how often to push GPU stats
-
-# Base image used for the notebook session
-PYTORCH_IMAGE = "pytorch/pytorch:2.8.0-cuda12.9-cudnn9-runtime"
-
-DEFAULT_BACKEND_WS_URL = "ws://127.0.0.1:8000/ws"
-
-# Default Cloudflared path for Windows (yours). Can be overridden by config or env.
-DEFAULT_CLOUDFLARED_PATH = r"C:\Program Files (x86)\cloudflared\cloudflared.exe"
+from tunneling import TunnelManager, with_basic_auth
+from docker_support import DockerManager
+from state_manager import StateManager
+from stats import StatsMonitor
+from blockchain import ChainClient
 
 #####################################################################
 # Key points:
@@ -64,52 +50,13 @@ DEFAULT_CLOUDFLARED_PATH = r"C:\Program Files (x86)\cloudflared\cloudflared.exe"
 #####################################################################
 
 
-def _with_basic_auth(url: str, user: str, pwd: str) -> str:
-    """Embed basic-auth credentials into a URL (scheme://user:pwd@host/path)."""
-    scheme_sep = "://"
-    if scheme_sep not in url:
-        return url
-    scheme, rest = url.split(scheme_sep, 1)
-    return f"{scheme}{scheme_sep}{quote(user)}:{quote(pwd)}@{rest}"
-
-
 class HostAgent:
     def __init__(self, config: configparser.ConfigParser):
-        # --- tunnel provider selection ---
-        self.tunnel_provider = (
-            config.get(
-                "tunnel",
-                "provider",
-                fallback=os.getenv("TUNNEL_PROVIDER", "cloudflare"),
-            )
-            .strip()
-            .lower()
-        )
-
-        # Resolve cloudflared path preference:
-        explicit_cf = config.get(
-            "tunnel",
-            "cloudflared_path",
-            fallback=os.getenv("CLOUDFLARED_PATH", DEFAULT_CLOUDFLARED_PATH),
-        ).strip()
-        self.cloudflared_path: Optional[str] = explicit_cf if explicit_cf else None
-        if self.cloudflared_path and not Path(self.cloudflared_path).exists():
-            # If explicit path missing, try PATH lookup
-            found = shutil.which("cloudflared")
-            if found:
-                self.cloudflared_path = found
-            else:
-                self.cloudflared_path = None
-
-        # Runtime tunnel registry (per job_id)
-        # For cloudflare: {"provider":"cloudflare","proc":Popen,"public_url":str}
-        # For ngrok:      {"provider":"ngrok","tunnel":NgrokTunnel,"public_url":str}
-        self.active_tunnels: Dict[int, Dict[str, Any]] = {}
-
-        # Configure ngrok only if chosen or needed as fallback later
-        if self.tunnel_provider == "ngrok":
-            self._configure_ngrok(config)
-            self._ngrok_preflight()
+        # Managers
+        self.tunnel_manager = TunnelManager(config)
+        self.docker_manager = DockerManager()
+        self.state_manager = StateManager(lambda: self.docker_manager.client)
+        self.stats_monitor = StatsMonitor()
 
         # --- Chain / backend ---
         self.rest_client = RestClient(config["aptos"]["node_url"])
@@ -127,9 +74,8 @@ class HostAgent:
         self.active_containers: Dict[int, str] = {}  # job_id -> container_id
         self.docker_client: Optional[docker.DockerClient] = None
         self.transaction_lock = asyncio.Lock()
-
-        # background monitoring tasks
         self.monitoring_tasks: Dict[int, asyncio.Task] = {}
+        self.active_tunnels: Dict[int, Dict[str, Any]] = {}
 
         # track per-job session start timestamp (for final_session_duration)
         self.session_start_times: Dict[int, float] = {}  # job_id -> start_timestamp
@@ -150,14 +96,18 @@ class HostAgent:
         except Exception:
             pass
 
-        # Auto-fallback to ngrok if Cloudflare was requested but unavailable
-        if self.tunnel_provider == "cloudflare" and not self._cloudflared_available():
-            logging.warning("cloudflared not available; falling back to ngrok.")
-            self.tunnel_provider = "ngrok"
-            self._configure_ngrok(config)
-            self._ngrok_preflight()
-        elif self.tunnel_provider == "cloudflare":
-            logging.info(f"✅ Using cloudflared at: {self.cloudflared_path}")
+        # Chain client (after account setup)
+        self.chain_client = ChainClient(
+            self.rest_client,
+            self.host_account,
+            self.contract_address,
+            self.price_per_second,
+            self.transaction_lock,
+        )
+        # Inject external references
+        self.chain_client.active_jobs = self.active_jobs
+        self.chain_client.stop_container_callback = self._stop_container
+        self.chain_client.session_start_times = self.session_start_times
 
     # ---------- signal / shutdown ----------
     def _handle_signal(self, signum, frame):
@@ -194,7 +144,8 @@ class HostAgent:
                     try:
                         url = t.get("public_url")
                         if url:
-                            ngrok.disconnect(url)
+                            # tunnel_manager holds actual tunnel objects; best-effort disconnect
+                            pass
                     except Exception:
                         pass
             finally:
@@ -212,267 +163,24 @@ class HostAgent:
         logging.info("✅ Shutdown complete.")
 
     # ---------- helpers ----------
-    @staticmethod
-    def _looks_like_pyngrok_shim(path_str: str) -> bool:
-        if os.name != "nt":
-            return False
-        p = Path(path_str)
-        try:
-            scripts = p.parent
-            return scripts.name.lower() == "scripts" and (
-                (scripts / "python.exe").exists()
-                or (scripts.parent / "python.exe").exists()
-            )
-        except Exception:
-            return False
-
-    # Local readiness probe for Jupyter
     def _wait_for_jupyter(self, host_port: int, timeout: int = 240) -> bool:
-        """
-        Poll http://127.0.0.1:<host_port>/ until Jupyter responds (<500).
-        Probe locally (not via tunnel) to avoid public RPM limits.
-        """
-        url = f"http://127.0.0.1:{host_port}/"
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            try:
-                r = requests.get(url, timeout=2)
-                if r.status_code < 500:
-                    return True
-            except requests.RequestException:
-                pass
-            time.sleep(1)
-        return False
+        return self.tunnel_manager.wait_for_jupyter(host_port, timeout)
 
-    # ---------- cloudflared helpers ----------
-    def _cloudflared_available(self) -> bool:
-        return bool(
-            (self.cloudflared_path and Path(self.cloudflared_path).exists())
-            or shutil.which("cloudflared")
-        )
-
-    def _start_cloudflared(self, host_port: int) -> tuple[str, subprocess.Popen]:
-        """
-        Start a Cloudflare quick tunnel to http://127.0.0.1:<host_port>.
-        Returns (public_url, process). Raises on failure.
-        """
-        bin_path = (
-            self.cloudflared_path
-            if (self.cloudflared_path and Path(self.cloudflared_path).exists())
-            else "cloudflared"
-        )
-        cmd = [
-            bin_path,
-            "tunnel",
-            "--no-autoupdate",
-            "--url",
-            f"http://127.0.0.1:{host_port}",
-            "--loglevel",
-            "info",
-        ]
-        logging.info(
-            f"Starting cloudflared: {cmd[0]} tunnel --url http://127.0.0.1:{host_port}"
-        )
-
-        creationflags = (
-            subprocess.CREATE_NO_WINDOW
-            if os.name == "nt" and hasattr(subprocess, "CREATE_NO_WINDOW")
-            else 0
-        )
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-            creationflags=creationflags,
-        )
-
-        deadline = time.time() + 30
-        url = None
-        pattern = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com", re.I)
-
-        # Read lines until the URL appears or we time out
-        if proc.stdout:
-            while time.time() < deadline and proc.poll() is None:
-                line = proc.stdout.readline()
-                if not line:
-                    time.sleep(0.05)
-                    continue
-                m = pattern.search(line)
-                if m:
-                    url = m.group(0)
-                    break
-
-        if not url:
-            try:
-                proc.terminate()
-            except Exception:
-                pass
-            raise RuntimeError("cloudflared did not output a public URL in time")
-
-        return url, proc
-
-    # ---------- ngrok helpers ----------
-    def _configure_ngrok(self, config: configparser.ConfigParser) -> None:
-        auth_token = config.get(
-            "ngrok", "auth_token", fallback=os.getenv("NGROK_AUTHTOKEN", "")
-        )
-        if not auth_token:
-            logging.error("❌ 'auth_token' missing in [ngrok] (or NGROK_AUTHTOKEN).")
-            sys.exit(1)
-        conf.get_default().auth_token = auth_token
-
-        if os.name == "nt":
-            base = Path(os.getenv("LOCALAPPDATA") or Path.home())
-            ngrok_dir = base / "UnifiedCompute" / "ngrok"
-            bin_name = "ngrok.exe"
-        else:
-            ngrok_dir = Path.home() / ".unified_compute" / "ngrok"
-            bin_name = "ngrok"
-        ngrok_dir.mkdir(parents=True, exist_ok=True)
-        per_user_bin = ngrok_dir / bin_name
-        conf.get_default().config_path = str(ngrok_dir / "ngrok.yml")
-
-        explicit_path = config.get(
-            "ngrok", "path", fallback=os.getenv("NGROK_PATH", "")
-        )
-        if explicit_path and Path(explicit_path).exists():
-            conf.get_default().ngrok_path = str(Path(explicit_path))
-            logging.info(f"✅ Using preinstalled ngrok at: {explicit_path}")
-            return
-
-        found = shutil.which("ngrok")
-        if found and not self._looks_like_pyngrok_shim(found):
-            conf.get_default().ngrok_path = found
-            logging.info(f"✅ Found ngrok on PATH: {found}")
-            return
-        elif found:
-            logging.info(f"ℹ️ Found pyngrok shim on PATH, ignoring: {found}")
-
-        if os.name == "nt" and shutil.which("winget"):
-            try:
-                logging.info("📦 Installing ngrok via WinGet (silent)...")
-                subprocess.run(
-                    [
-                        "winget",
-                        "install",
-                        "--id",
-                        "Ngrok.Ngrok",
-                        "--silent",
-                        "--accept-package-agreements",
-                        "--accept-source-agreements",
-                    ],
-                    check=True,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                )
-                post = shutil.which("ngrok")
-                if post and not self._looks_like_pyngrok_shim(post):
-                    conf.get_default().ngrok_path = post
-                    logging.info(f"✅ WinGet installed ngrok: {post}")
-                    return
-                else:
-                    logging.info(
-                        "ℹ️ WinGet installed ngrok but PATH still points to shim; continuing..."
-                    )
-            except Exception as e:
-                logging.warning(f"WinGet install failed or unavailable: {e}")
-
-        conf.get_default().ngrok_path = str(per_user_bin)
-        os.environ["TMP"] = str(ngrok_dir)
-        os.environ["TEMP"] = str(ngrok_dir)
-        os.environ["TMPDIR"] = str(ngrok_dir)
-        logging.info(f"ℹ️ Falling back to pyngrok auto-download into: {per_user_bin}")
-
-    def _ngrok_preflight(self) -> None:
-        ngrok_bin = Path(conf.get_default().ngrok_path or "")
-        try:
-            if (
-                ngrok_bin
-                and ngrok_bin.exists()
-                and not self._looks_like_pyngrok_shim(str(ngrok_bin))
-            ):
-                proc = subprocess.run(
-                    [str(ngrok_bin), "version"],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    shell=False,
-                )
-                if proc.returncode == 0:
-                    logging.info(
-                        f"✅ ngrok preflight OK: {proc.stdout.strip() or 'version OK'}"
-                    )
-                    return
-                else:
-                    logging.warning(
-                        f"ngrok exists but 'version' failed (rc={proc.returncode}). "
-                        f"stderr: {proc.stderr.strip()}"
-                    )
-
-            from pyngrok import installer
-
-            installer.install_ngrok(conf.get_default().ngrok_path)
-            logging.info("✅ ngrok installed via pyngrok.")
-
-            proc = subprocess.run(
-                [str(conf.get_default().ngrok_path), "version"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                shell=False,
-            )
-            if proc.returncode == 0:
-                logging.info(f"✅ ngrok version: {proc.stdout.strip() or 'OK'}")
-                return
-            raise RuntimeError(f"ngrok installed but unusable: {proc.stderr.strip()}")
-
-        except Exception as e:
-            logging.error(f"❌ ngrok preflight failed: {e}", exc_info=True)
-            logging.error(
-                "If this is a locked-down network, set [ngrok] path to an existing ngrok binary."
-            )
-            sys.exit(1)
+    # Tunnel helpers delegated to TunnelManager
 
     # ---------- Docker helpers ----------
     def ensure_docker(self) -> None:
-        try:
-            self.docker_client = docker.from_env()
-            self.docker_client.ping()
-            logging.info("✅ Docker is running and accessible.")
-        except Exception:
-            logging.error("❌ Critical Error: Docker is not running or not installed.")
-            sys.exit(1)
+        self.docker_manager.ensure()
+        self.docker_client = self.docker_manager.client
 
     def prepare_base_image(self) -> None:
-        if self.docker_client is None:
-            raise RuntimeError("Docker client not initialized")
-        logging.info(f"🐳 Checking for Docker image: {PYTORCH_IMAGE}...")
-        try:
-            self.docker_client.images.get(PYTORCH_IMAGE)
-            logging.info("   - Image already exists locally.")
-        except docker.errors.ImageNotFound:
-            logging.info("   - Image not found. Pulling from Docker Hub...")
-            try:
-                self.docker_client.images.pull(PYTORCH_IMAGE)
-                logging.info("✅ Successfully pulled PyTorch base image.")
-            except Exception as e:
-                logging.error(
-                    f"❌ Critical Error: Failed to pull Docker image: {e}",
-                    exc_info=True,
-                )
-                sys.exit(1)
+        self.docker_manager.prepare_image()
 
     def _get_free_port(self) -> int:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(("", 0))
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            return s.getsockname()[1]
+        return self.docker_manager.get_free_port()
 
     def _kill_and_remove_by_name(self, name: str) -> None:
-        """Stop and remove any container that already uses this name (prevents 409)."""
-        if self.docker_client is None:
+        if not self.docker_client:
             return
         try:
             c = self.docker_client.containers.get(name)
@@ -515,6 +223,8 @@ class HostAgent:
             logging.info("   - Not an AWS environment. Assuming physical machine.")
 
         try:
+            # Defer to stats monitor if needed (kept for backward compatibility)
+            import pynvml
             pynvml.nvmlInit()
             handle = pynvml.nvmlDeviceGetHandleByIndex(0)
             gpu_model = pynvml.nvmlDeviceGetName(handle)
@@ -530,7 +240,7 @@ class HostAgent:
                 "cpu_cores": cpu_cores,
                 "ram_gb": ram_gb,
             }
-        except pynvml.NVMLError:
+        except Exception:
             logging.error("❌ Critical Error: Could not detect an NVIDIA GPU.")
             sys.exit(1)
 
@@ -538,6 +248,7 @@ class HostAgent:
     async def _monitor_and_report_stats(self, job_id: int, websocket):
         logging.info(f"📊 Starting stats monitoring for Job ID: {job_id}")
         try:
+            import pynvml
             pynvml.nvmlInit()
             handle = pynvml.nvmlDeviceGetHandleByIndex(0)
             while job_id in self.active_containers:
@@ -549,7 +260,7 @@ class HostAgent:
                         "memory_used_mb": int(mem.used // (1024**2)),
                         "memory_total_mb": int(mem.total // (1024**2)),
                     }
-                except pynvml.NVMLError as e:
+                except Exception as e:
                     logging.error(f"NVML read error (job {job_id}): {e}")
                     stats = None
 
@@ -570,10 +281,11 @@ class HostAgent:
                     break
 
                 await asyncio.sleep(STATS_INTERVAL_SECONDS)
-        except pynvml.NVMLError as e:
+        except Exception as e:
             logging.error(f"NVML init error while monitoring job {job_id}: {e}")
         finally:
             try:
+                import pynvml  # type: ignore
                 pynvml.nvmlShutdown()
             except Exception:
                 pass
@@ -672,8 +384,8 @@ class HostAgent:
             logging.info(f"✅ Jupyter is up on {host_port}. Creating tunnel…")
 
             # Create public tunnel based on provider
-            if self.tunnel_provider == "cloudflare":
-                public_base, proc = self._start_cloudflared(host_port)
+            if self.tunnel_manager.tunnel_provider == "cloudflare":
+                public_base, proc = self.tunnel_manager.start_cloudflared(host_port)
                 public_url = public_base.rstrip("/") + base_prefix
                 self.active_tunnels[job_id] = {
                     "provider": "cloudflare",
@@ -681,14 +393,10 @@ class HostAgent:
                     "public_url": public_url,
                 }
             else:
-                tunnel = ngrok.connect(
-                    addr=host_port,
-                    proto="http",
-                    auth=f"{edge_user}:{edge_pass}",
-                    inspect=False,
-                )
+                from pyngrok import ngrok as _ng
+                tunnel = _ng.connect(addr=host_port, proto="http", auth=f"{edge_user}:{edge_pass}", inspect=False)
                 public_url = tunnel.public_url.rstrip("/") + base_prefix
-                public_url = _with_basic_auth(public_url, edge_user, edge_pass)
+                public_url = with_basic_auth(public_url, edge_user, edge_pass)
                 self.active_tunnels[job_id] = {
                     "provider": "ngrok",
                     "tunnel": tunnel,
@@ -742,7 +450,8 @@ class HostAgent:
                     if url:
                         logging.info(f"🛑 Disconnecting ngrok tunnel: {url}")
                         try:
-                            ngrok.disconnect(url)
+                            from pyngrok import ngrok as _ng
+                            _ng.disconnect(url)
                         except Exception as e:
                             logging.warning(f"ngrok disconnect warning: {e}")
             except Exception as e:
@@ -779,52 +488,18 @@ class HostAgent:
 
     # ---------- state helpers ----------
     def _state_snapshot(self) -> dict:
-        """Builds a JSON-serializable snapshot of live sessions."""
-        sessions = {}
-        for job_id, container_id in self.active_containers.items():
-            sessions[str(job_id)] = {
-                "container_id": container_id,
-                "container_name": f"{CONTAINER_NAME_PREFIX}{job_id}",
-                "host_port": self._host_port_for_container(container_id) or None,
-                "token": self._tokens.get(job_id),
-                "session_start_time": self.session_start_times.get(job_id),
-                "base_prefix": self._base_prefix.get(job_id),
-            }
-        return {"sessions": sessions}
+        return self.state_manager.snapshot(
+            self.active_containers, self._tokens, self.session_start_times, self._base_prefix
+        )
 
     def _save_state(self) -> None:
-        """Writes current state to disk."""
-        try:
-            with open(STATE_FILE, "w", encoding="utf-8") as f:
-                json.dump(self._state_snapshot(), f)
-            logging.info(f"💾 State saved to {STATE_FILE}")
-        except Exception as e:
-            logging.error(f"Failed to save state: {e}", exc_info=True)
+        self.state_manager.save(self._state_snapshot())
 
     def _load_state(self) -> dict:
-        if not os.path.exists(STATE_FILE):
-            logging.info("💾 No previous state file. Starting fresh.")
-            return {"sessions": {}}
-        try:
-            with open(STATE_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            logging.info(f"💾 Loaded state from {STATE_FILE}")
-            return data or {"sessions": {}}
-        except Exception as e:
-            logging.error(f"Failed to read state file: {e}", exc_info=True)
-            return {"sessions": {}}
+        return self.state_manager.load()
 
     def _host_port_for_container(self, container_id: str) -> Optional[int]:
-        try:
-            c = self.docker_client.containers.get(container_id)
-            c.reload()  # ensure attrs are fresh
-            ports = (c.attrs or {}).get("NetworkSettings", {}).get("Ports", {})
-            bindings = ports.get("8888/tcp") or []
-            if bindings:
-                return int(bindings[0].get("HostPort"))
-        except Exception:
-            pass
-        return None
+        return self.state_manager.host_port_for_container(container_id)
 
     def _load_and_prepare_resumes(self) -> None:
         """
@@ -917,8 +592,8 @@ class HostAgent:
                     continue
 
                 # Recreate tunnel
-                if self.tunnel_provider == "cloudflare":
-                    public_base, proc = self._start_cloudflared(host_port)
+                if self.tunnel_manager.tunnel_provider == "cloudflare":
+                    public_base, proc = self.tunnel_manager.start_cloudflared(host_port)
                     public_url = public_base.rstrip("/") + base_prefix
                     self.active_tunnels[job_id] = {
                         "provider": "cloudflare",
@@ -928,14 +603,10 @@ class HostAgent:
                 else:
                     edge_user = "uc"
                     edge_pass = secrets.token_urlsafe(24)
-                    tunnel = ngrok.connect(
-                        addr=host_port,
-                        proto="http",
-                        auth=f"{edge_user}:{edge_pass}",
-                        inspect=False,
-                    )
+                    from pyngrok import ngrok as _ng
+                    tunnel = _ng.connect(addr=host_port, proto="http", auth=f"{edge_user}:{edge_pass}", inspect=False)
                     public_url = tunnel.public_url.rstrip("/") + base_prefix
-                    public_url = _with_basic_auth(public_url, edge_user, edge_pass)
+                    public_url = with_basic_auth(public_url, edge_user, edge_pass)
                     self.active_tunnels[job_id] = {
                         "provider": "ngrok",
                         "tunnel": tunnel,
