@@ -1,98 +1,162 @@
 import os
+import shlex
 import subprocess
+import logging
 from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Tuple, Union
 
-# If you already centralize this constant, import from your existing constants module instead
-PYTORCH_IMAGE = os.getenv(
-    "PYTORCH_IMAGE", "pytorch/pytorch:2.8.0-cuda12.9-cudnn9-runtime"
-)
+log = logging.getLogger("host-agent.docker")
+
+# ---- Constants (import if available; otherwise sane defaults) ----
+try:
+    from constants import PYTORCH_IMAGE as DEFAULT_IMAGE
+except Exception:
+    DEFAULT_IMAGE = "pytorch/pytorch:2.8.0-cuda12.9-cudnn9-runtime"
+
+try:
+    from constants import CONTAINER_NAME_PREFIX as NAME_PREFIX
+except Exception:
+    NAME_PREFIX = "uc-job-"
 
 SESSIONS_ROOT = Path(os.getenv("SESSIONS_ROOT", "./sessions")).resolve()
 SESSIONS_ROOT.mkdir(parents=True, exist_ok=True)
 
-
-def build_jupyter_cmd(host_port: int, token: str = "") -> list[str]:
-    """
-    Start Jupyter Lab inside the container. We *install* jupyterlab first because the
-    PyTorch runtime image does not ship it. We then run via python -m jupyter to avoid PATH issues.
-    """
-    bootstrap = " && ".join(
-        [
-            # make sure pip exists and is up to date
-            "python -m pip install --no-cache-dir --upgrade pip",
-            # install jupyterlab only if missing (this is idempotent and fast on cache)
-            'python -c "import importlib.util, sys; '
-            "sys.exit(0 if importlib.util.find_spec('jupyterlab') else 1)\" || "
-            "python -m pip install --no-cache-dir jupyterlab",
-            # run jupyter on 0.0.0.0:8888, no browser, empty token
-            f"python -m jupyter lab --ip=0.0.0.0 --port=8888 --no-browser --NotebookApp.token='{token}' --NotebookApp.password=''",
-        ]
-    )
-    return ["bash", "-lc", bootstrap]
+DOCKER_BIN = os.environ.get("DOCKER_BIN", "docker")
 
 
-def build_run_cmd(
-    job_id: str | int,
-    host_port: int,
-    mounts: list[tuple[str, str]] | None = None,
-    envs: dict[str, str] | None = None,
-) -> list[str]:
-    """
-    Compose the 'docker run' command that launches the Jupyter Lab session.
-    - Maps host_port -> container 8888
-    - Mounts a per-job workspace at /workspace
-    """
-    name = f"uc-job-{job_id}"
-    job_dir = (SESSIONS_ROOT / str(job_id)).resolve()
-    job_dir.mkdir(parents=True, exist_ok=True)
+class DockerRuntime:
+    """Helper to launch JupyterLab inside a GPU-enabled Docker container."""
 
-    cmd = [
-        "docker",
-        "run",
-        "--rm",
-        "--gpus",
-        "all",
-        "-p",
-        f"{host_port}:8888",
-        "--name",
-        name,
-        "-w",
-        "/workspace",
-        "-v",
-        f"{job_dir}:/workspace",
-    ]
+    def __init__(self, image: Optional[str] = None):
+        self.image = image or DEFAULT_IMAGE
+        self.bin = DOCKER_BIN
 
-    # Additional mounts
-    if mounts:
-        for host_path, container_path in mounts:
-            cmd += ["-v", f"{Path(host_path).resolve()}:{container_path}"]
+    # ------------------------------- utils -------------------------------
 
-    # Environment variables
-    if envs:
-        for k, v in envs.items():
-            cmd += ["-e", f"{k}={v}"]
+    def _run(self, args: List[str]) -> subprocess.CompletedProcess:
+        """Run a docker CLI command and return the CompletedProcess (no raise)."""
+        log.info("[docker] %s", " ".join(shlex.quote(a) for a in args))
+        return subprocess.run(args, capture_output=True, text=True, check=False)
 
-    # Image + command
-    cmd += [PYTORCH_IMAGE]
-    cmd += build_jupyter_cmd(host_port=host_port, token="")
+    def _container_name(self, job_id: Union[int, str]) -> str:
+        return f"{NAME_PREFIX}{job_id}"
 
-    return cmd
+    # ------------------------------- public -------------------------------
 
+    def ensure_image(self, image: Optional[str] = None) -> None:
+        """
+        Make sure the base image exists locally (pull if missing).
+        Accepts optional `image` override for compatibility with callers that pass it.
+        """
+        img = image or self.image
+        r = self._run([self.bin, "image", "inspect", img])
+        if r.returncode != 0:
+            log.info(f"Pulling Docker image: {img}")
+            r = self._run([self.bin, "pull", img])
+            if r.returncode != 0:
+                raise RuntimeError(f"Docker pull failed: {r.stderr.strip()}")
 
-def start_session_container(job_id: str | int, host_port: int) -> subprocess.Popen:
-    """
-    Launch the container and return the Popen handle. Caller can read stdout/stderr.
-    """
-    cmd = build_run_cmd(job_id=job_id, host_port=host_port)
-    try:
-        # Unbuffered text mode so logs stream to backend logger
-        return subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-            universal_newlines=True,
+    def start_jupyter(
+        self,
+        job_id: int,
+        host_port: int,
+        token: str = "",
+        mounts: Optional[Iterable[Tuple[str, str]]] = None,
+        envs: Optional[Dict[str, str]] = None,
+        workdir: str = "/workspace",
+        image: Optional[str] = None,
+    ) -> str:
+        """
+        Start a containerized JupyterLab on container port 8888 mapped to host_port.
+
+        - Installs jupyterlab if missing (idempotent).
+        - Launches via `python -m jupyter lab ...` (avoids PATH reliance on `jupyter`).
+        - Returns the container ID.
+        """
+        img = image or self.image
+        name = self._container_name(job_id)
+
+        # Stop any previous container with the same name (idempotent)
+        self._run([self.bin, "rm", "-f", name])
+
+        # Per-job workspace
+        job_dir = (SESSIONS_ROOT / str(job_id)).resolve()
+        job_dir.mkdir(parents=True, exist_ok=True)
+
+        # Bootstrap sequence executed inside the container
+        bootstrap = " && ".join(
+            [
+                # Upgrade pip (safe & quick)
+                "python -m pip install --no-cache-dir --upgrade pip",
+                # Install jupyterlab only if absent (idempotent)
+                "python - <<'PY'\n"
+                "import importlib.util, sys\n"
+                "sys.exit(0 if importlib.util.find_spec('jupyterlab') else 1)\n"
+                "PY\n"
+                " || python -m pip install --no-cache-dir jupyterlab",
+                # Run JupyterLab via module to avoid PATH issues
+                (
+                    "python -m jupyter lab "
+                    "--ip=0.0.0.0 --port=8888 --no-browser "
+                    f"--NotebookApp.token='{token}' --NotebookApp.password=''"
+                ),
+            ]
         )
-    except Exception as e:
-        raise RuntimeError(f"Docker run failed: {e}")
+
+        # Build docker run command
+        cmd: List[str] = [
+            self.bin,
+            "run",
+            "-d",
+            "--gpus",
+            "all",
+            "--name",
+            name,
+            "-p",
+            f"{host_port}:8888",
+            "-w",
+            workdir,
+            "-v",
+            f"{str(job_dir)}:{workdir}",
+            # image + command
+            img,
+            "bash",
+            "-lc",
+            bootstrap,
+        ]
+
+        # Extra mounts
+        if mounts:
+            # Insert before image so they apply correctly
+            insert_at = len(cmd) - 3
+            for host_path, container_path in mounts:
+                cmd[insert_at:insert_at] = [
+                    "-v",
+                    f"{Path(host_path).resolve()}:{container_path}",
+                ]
+                insert_at += 2
+
+        # Env vars
+        if envs:
+            insert_at = len(cmd) - 3
+            for k, v in envs.items():
+                cmd[insert_at:insert_at] = ["-e", f"{k}={v}"]
+                insert_at += 2
+
+        # Ensure image and run
+        self.ensure_image(img)
+        r = self._run(cmd)
+        if r.returncode != 0:
+            raise RuntimeError(f"Docker run failed: {r.stderr.strip()}")
+
+        cid = r.stdout.strip()
+        if not cid:
+            raise RuntimeError("Docker run returned empty container ID")
+
+        log.info(f"Container started: {cid} ({name}) http://127.0.0.1:{host_port}")
+        return cid
+
+    def stop(self, job_id: int) -> None:
+        """Stop and remove the job container (idempotent)."""
+        name = self._container_name(job_id)
+        self._run([self.bin, "rm", "-f", name])

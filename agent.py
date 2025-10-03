@@ -98,23 +98,46 @@ class DockerRuntime:
     def start_jupyter(self, job_id: int, image: str, host_port: int, token: str) -> str:
         """
         Start a Jupyter server inside a container, expose host_port.
+        Bootstraps JupyterLab inside the container before launching it.
         Returns container_id.
         """
         name = f"{CONTAINER_NAME_PREFIX}{job_id}"
         # Stop/remove any old
         self._run(f"{self.bin} rm -f {name}")
 
+        # One-line bootstrap run by bash inside the container:
+        #  1) upgrade pip
+        #  2) install jupyterlab if missing (idempotent)
+        #  3) launch Jupyter via python -m (no reliance on 'jupyter' binary in PATH)
+        bootstrap = " && ".join(
+            [
+                "python -m pip install --no-cache-dir --upgrade pip",
+                "python - <<'PY'\n"
+                "import importlib.util, sys\n"
+                "sys.exit(0 if importlib.util.find_spec('jupyterlab') else 1)\n"
+                "PY\n"
+                " || python -m pip install --no-cache-dir jupyterlab",
+                f"python -m jupyter lab --ip=0.0.0.0 --port=8888 --no-browser "
+                f"--NotebookApp.token='{token}' --NotebookApp.password=''",
+            ]
+        )
+
+        # IMPORTANT: run via bash -lc "<bootstrap>"
         cmd = (
             f"{self.bin} run -d --gpus all --name {name} "
             f"-p {host_port}:8888 "
-            f"-e JUPYTER_TOKEN={shlex.quote(token)} "
             f"{image} "
-            f"jupyter lab --ip=0.0.0.0 --port=8888 --no-browser --NotebookApp.token={shlex.quote(token)}"
+            f"bash -lc {shlex.quote(bootstrap)}"
         )
+
         r = self._run(cmd)
         if r.returncode != 0:
             raise RuntimeError(f"Docker run failed: {r.stderr.strip()}")
+
         container_id = r.stdout.strip()
+        if not container_id:
+            raise RuntimeError("Docker run returned empty container ID")
+
         log.info(f"Container started: {container_id} ({name}) on :{host_port}")
         return container_id
 
