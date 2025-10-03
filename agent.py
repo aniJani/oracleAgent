@@ -1,4 +1,3 @@
-# agent.py
 import os
 import sys
 import json
@@ -60,7 +59,7 @@ def _free_tcp_port(start: int = 7800, end: int = 7999) -> int:
     raise RuntimeError("No free port found in range 7800-7999")
 
 
-def _wait_http_ready(url: str, timeout: float = 45.0) -> bool:
+def _wait_http_ready(url: str, timeout: float = 60.0) -> bool:
     import urllib.request
     import urllib.error
 
@@ -81,7 +80,7 @@ class DockerRuntime:
         self.bin = os.environ.get("DOCKER_BIN", "docker")
 
     def _run(self, cmd: str) -> subprocess.CompletedProcess:
-        log.debug(f"[docker] {cmd}")
+        log.info("[docker] %s", cmd)
         return subprocess.run(
             shlex.split(cmd), capture_output=True, text=True, check=False
         )
@@ -97,47 +96,43 @@ class DockerRuntime:
 
     def start_jupyter(self, job_id: int, image: str, host_port: int, token: str) -> str:
         """
-        Start a Jupyter server inside a container, expose host_port.
-        Bootstraps JupyterLab inside the container before launching it.
+        Start a classic Jupyter Notebook server inside the container, expose host_port.
         Returns container_id.
         """
         name = f"{CONTAINER_NAME_PREFIX}{job_id}"
         # Stop/remove any old
         self._run(f"{self.bin} rm -f {name}")
 
-        # One-line bootstrap run by bash inside the container:
-        #  1) upgrade pip
-        #  2) install jupyterlab if missing (idempotent)
-        #  3) launch Jupyter via python -m (no reliance on 'jupyter' binary in PATH)
+        # --- Classic Notebook bootstrap (no Lab) ---
         bootstrap = " && ".join(
             [
                 "python -m pip install --no-cache-dir --upgrade pip",
+                # install classic notebook if absent
                 "python - <<'PY'\n"
                 "import importlib.util, sys\n"
-                "sys.exit(0 if importlib.util.find_spec('jupyterlab') else 1)\n"
+                "sys.exit(0 if importlib.util.find_spec('notebook') else 1)\n"
                 "PY\n"
-                " || python -m pip install --no-cache-dir jupyterlab",
-                f"python -m jupyter lab --ip=0.0.0.0 --port=8888 --no-browser "
-                f"--NotebookApp.token='{token}' --NotebookApp.password=''",
+                " || python -m pip install --no-cache-dir 'notebook==6.5.*'",
+                # launch notebook (no token/password)
+                "python -m notebook --ip=0.0.0.0 --port=8888 --no-browser "
+                "--NotebookApp.token='' --NotebookApp.password='' "
+                "--NotebookApp.allow_origin='*' --NotebookApp.disable_check_xsrf=True",
+                "--allow-root"
             ]
         )
 
-        # IMPORTANT: run via bash -lc "<bootstrap>"
         cmd = (
             f"{self.bin} run -d --gpus all --name {name} "
             f"-p {host_port}:8888 "
             f"{image} "
             f"bash -lc {shlex.quote(bootstrap)}"
         )
-
         r = self._run(cmd)
         if r.returncode != 0:
             raise RuntimeError(f"Docker run failed: {r.stderr.strip()}")
-
         container_id = r.stdout.strip()
         if not container_id:
             raise RuntimeError("Docker run returned empty container ID")
-
         log.info(f"Container started: {container_id} ({name}) on :{host_port}")
         return container_id
 
@@ -157,16 +152,13 @@ class TunnelRuntime:
         Start cloudflared and parse the public URL from stdout.
         Returns the public URL.
         """
-        # Ensure binary exists
         if not Path(self.bin).exists():
             raise RuntimeError(f"cloudflared not found at {self.bin}")
 
-        # Stop any existing
         self.stop(job_id)
 
         cmd = f'"{self.bin}" tunnel --url http://127.0.0.1:{local_port}'
         log.info(f"[tunnel] {cmd}")
-        # start and read its stdout to capture the URL
         proc = subprocess.Popen(
             shlex.split(cmd),
             stdout=subprocess.PIPE,
@@ -179,24 +171,19 @@ class TunnelRuntime:
 
         public_url: Optional[str] = None
         deadline = time.time() + timeout
-        # parse lines until we see trycloudflare.com URL
         while time.time() < deadline:
             line = proc.stdout.readline() if proc.stdout else ""
             if not line:
                 time.sleep(0.2)
                 continue
             log.info(f"[tunnel] {line.strip()}")
-            # common pattern: "trycloudflare.com"
             if "trycloudflare.com" in line:
-                # extract first URL-looking token
                 for token in line.split():
                     if "http://" in token or "https://" in token:
                         public_url = token.strip()
                         break
             if public_url:
                 break
-
-            # if process died, break early
             if proc.poll() is not None:
                 break
 
@@ -259,7 +246,6 @@ class HostAgent:
     def _detect_specs(self) -> dict:
         """Detect GPU/CPU/RAM for registration."""
         specs = {}
-        # GPU
         pynvml.nvmlInit()
         try:
             handle = pynvml.nvmlDeviceGetHandleByIndex(0)
@@ -269,7 +255,6 @@ class HostAgent:
             specs["gpu_model"] = str(name)
         finally:
             pynvml.nvmlShutdown()
-        # CPU & RAM
         specs["cpu_cores"] = int(psutil.cpu_count(logical=True))
         specs["ram_gb"] = int(round(psutil.virtual_memory().total / (1024**3)))
         return specs
@@ -352,7 +337,6 @@ class HostAgent:
             loop.run_until_complete(self._set_availability(False))
         finally:
             loop.close()
-        # stop anything left
         for job_id in list(self.sessions.keys()):
             with contextlib.suppress(Exception):
                 self._stop_session_sync(job_id)
@@ -365,22 +349,17 @@ class HostAgent:
         image = image or PYTORCH_IMAGE
         self.docker.ensure_image(image)
 
-        # Choose a free port and token
         port = _free_tcp_port()
         token = os.environ.get("JUPYTER_TOKEN", f"token-{job_id}-{int(time.time())}")
 
-        # Start Jupyter container
         container_id = self.docker.start_jupyter(
             job_id=job_id, image=image, host_port=port, token=token
         )
 
-        # Wait for local Jupyter to respond
-        if not _wait_http_ready(f"http://127.0.0.1:{port}", timeout=60):
-            # clean up on failure
+        if not _wait_http_ready(f"http://127.0.0.1:{port}", timeout=180):
             self.docker.stop(job_id)
             raise RuntimeError("Jupyter did not become ready in time")
 
-        # Start Cloudflare tunnel and obtain public URL
         public_url = self.tunnel.start(job_id=job_id, local_port=port, timeout=45)
 
         session = {
@@ -406,11 +385,7 @@ class HostAgent:
         if not isinstance(job_id, int):
             await ws.send(
                 json.dumps(
-                    {
-                        "status": "error",
-                        "error": "invalid_job_id",
-                        "detail": str(job_id),
-                    }
+                    {"status": "error", "error": "invalid_job_id", "detail": str(job_id)}
                 )
             )
             return
@@ -458,24 +433,13 @@ class HostAgent:
         if not isinstance(job_id, int):
             await ws.send(
                 json.dumps(
-                    {
-                        "status": "error",
-                        "error": "invalid_job_id",
-                        "detail": str(job_id),
-                    }
+                    {"status": "error", "error": "invalid_job_id", "detail": str(job_id)}
                 )
             )
             return
         try:
             self._stop_session_sync(job_id)
-            await ws.send(
-                json.dumps(
-                    {
-                        "status": "session_stopped",
-                        "job_id": job_id,
-                    }
-                )
-            )
+            await ws.send(json.dumps({"status": "session_stopped", "job_id": job_id}))
         except Exception as e:
             log.error(f"stop_session failed for job {job_id}: {e}")
             await ws.send(
@@ -493,7 +457,6 @@ class HostAgent:
     # Backend WebSocket loop
     # -------------------------------------------------------------------------
     async def _ws_loop(self):
-        """Maintain a persistent WS connection: ws://.../ws/{host_address}."""
         host_addr = str(self._acct.address())
         url = f"{self.ws_base}/{host_addr}"
         log.info(f"Connecting WS → {url}")
@@ -508,7 +471,6 @@ class HostAgent:
                     max_size=None,
                 ) as ws:
                     log.info(f"WS connected → {url}")
-                    # It is OK to send a hello; backend should ignore or log it
                     await ws.send(json.dumps({"kind": "hello", "addr": host_addr}))
 
                     while True:
@@ -519,7 +481,6 @@ class HostAgent:
                             log.warning(f"WS non-JSON message: {raw!r}")
                             continue
 
-                        # Accept both legacy {"action": "..."} and newer {"kind": "..."}
                         action = msg.get("action") or msg.get("kind")
 
                         if action == "hello":
