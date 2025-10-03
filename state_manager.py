@@ -1,63 +1,64 @@
 import json
-import logging
-import os
-from typing import Dict, Optional
 from pathlib import Path
+from typing import Dict, Any
 
-from constants import STATE_FILE, CONTAINER_NAME_PREFIX
-
-logger = logging.getLogger(__name__)
+try:
+    from constants import STATE_FILE
+except ImportError:
+    STATE_FILE = Path.cwd() / "agent_state.json"
 
 
 class StateManager:
-    def __init__(self, docker_client_ref_getter):
+    """
+    Simple JSON-based state store used by the agent and GUI.
+    Schema:
+    {
+      "sessions": {
+        "<job_id_str>": {
+          "status": "...",
+          "started_at": 0,
+          ...
+        }
+      },
+      "host": {
+        "registered": bool,
+        "identifier": str,
+        "registered_at": int
+      }
+    }
+    """
+
+    def __init__(self, docker_client_ref_getter=None):
         self._docker_client_ref_getter = docker_client_ref_getter
+        self._state_path = Path(STATE_FILE)
 
-    def host_port_for_container(self, container_id: str) -> Optional[int]:
-        client = self._docker_client_ref_getter()
-        if not client:
-            return None
+    # ---------- Core R/W ----------
+    def load(self) -> Dict[str, Any]:
+        if not self._state_path.exists():
+            return {"sessions": {}, "host": {}}
         try:
-            c = client.containers.get(container_id)
-            c.reload()
-            ports = (c.attrs or {}).get("NetworkSettings", {}).get("Ports", {})
-            bindings = ports.get("8888/tcp") or []
-            if bindings:
-                return int(bindings[0].get("HostPort"))
-        except Exception:
-            pass
-        return None
-
-    def load(self) -> dict:
-        if not os.path.exists(STATE_FILE):
-            logger.info("💾 No previous state file. Starting fresh.")
-            return {"sessions": {}}
-        try:
-            with open(STATE_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            logger.info(f"💾 Loaded state from {STATE_FILE}")
-            return data or {"sessions": {}}
-        except Exception as e:
-            logger.error(f"Failed to read state file: {e}", exc_info=True)
-            return {"sessions": {}}
-
-    def snapshot(self, active_containers, tokens, session_start_times, base_prefix) -> dict:
-        sessions = {}
-        for job_id, container_id in active_containers.items():
-            sessions[str(job_id)] = {
-                "container_id": container_id,
-                "container_name": f"{CONTAINER_NAME_PREFIX}{job_id}",
-                "host_port": self.host_port_for_container(container_id) or None,
-                "token": tokens.get(job_id),
-                "session_start_time": session_start_times.get(job_id),
-                "base_prefix": base_prefix.get(job_id),
+            return json.loads(self._state_path.read_text(encoding="utf-8")) or {
+                "sessions": {},
+                "host": {},
             }
-        return {"sessions": sessions}
+        except Exception:
+            return {"sessions": {}, "host": {}}
 
-    def save(self, snapshot: dict) -> None:
-        try:
-            with open(STATE_FILE, "w", encoding="utf-8") as f:
-                json.dump(snapshot, f)
-            logger.info(f"💾 State saved to {STATE_FILE}")
-        except Exception as e:
-            logger.error(f"Failed to save state: {e}", exc_info=True)
+    def save(self, state: Dict[str, Any]) -> None:
+        # Ensure minimal keys always present
+        state.setdefault("sessions", {})
+        state.setdefault("host", {})
+        self._state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+    # ---------- Convenience ----------
+    def set_host_registered(self, identifier: str, ts: int) -> None:
+        st = self.load()
+        st.setdefault("host", {})
+        st["host"]["registered"] = True
+        st["host"]["identifier"] = identifier
+        st["host"]["registered_at"] = ts
+        self.save(st)
+
+    def get_host_registered(self) -> bool:
+        st = self.load()
+        return bool(st.get("host", {}).get("registered"))

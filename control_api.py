@@ -15,6 +15,7 @@ def create_app(agent) -> "FastAPI":
     Endpoints:
     - GET /health -> {status: ok}
     - GET /sessions -> current sessions from state file
+    - POST /register -> one-time device registration
     - POST /start/{job_id}
     - POST /stop/{job_id}
     """
@@ -64,6 +65,14 @@ def create_app(agent) -> "FastAPI":
                 agent._result_cond.wait(timeout=remaining)  # type: ignore[attr-defined]
         # Timeout
         return {"status": "accepted", "detail": "processing in background"}
+
+    @app.post("/register")
+    def register():
+        try:
+            result = _request_and_wait({"action": "register_device"})
+            return result
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
 
     @app.post("/start/{job_id}")
     def start(job_id: int):

@@ -1,28 +1,71 @@
+import argparse
 import asyncio
 import configparser
 import logging
+import sys
 
 from agent import HostAgent
 
-async def main():
-    logging.info("Loading configuration from config.ini...")
-    config = configparser.ConfigParser()
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s"
+)
+
+
+def load_config() -> configparser.ConfigParser:
+    cfg = configparser.ConfigParser()
     try:
-        config.read_file(open("config.ini"))
-        _ = config["aptos"]["private_key"]
-        _ = config["aptos"]["contract_address"]
-        _ = config["aptos"]["node_url"]
-        _ = config["host"]["price_per_second"]
+        with open("config.ini", "r", encoding="utf-8") as f:
+            cfg.read_file(f)
+        # Validate required keys
+        _ = cfg["aptos"]["private_key"]
+        _ = cfg["aptos"]["contract_address"]
+        _ = cfg["aptos"]["node_url"]
+        _ = cfg["host"]["price_per_second"]
+        return cfg
     except (KeyError, FileNotFoundError) as e:
-        logging.error(
-            f"Configuration error in 'config.ini': {e}. Please ensure the file exists and has required keys."
-        )
-        return
-    agent = HostAgent(config)
-    await agent.run()
+        logging.error(f"Configuration error in 'config.ini': {e}")
+        sys.exit(1)
+
+
+async def _run_agent():
+    cfg = load_config()
+    agent = HostAgent(cfg)
+    try:
+        await agent.run()
+    finally:
+        agent.shutdown()
+
+
+async def _register_once():
+    cfg = load_config()
+    agent = HostAgent(cfg)
+    result = await agent.register_device_if_needed()
+    # Print a single-line outcome so the GUI can parse/log it
+    if result["status"] == "ok":
+        msg = result["message"]
+        tx = result.get("tx_hash")
+        if tx:
+            print(f"REGISTER_OK tx={tx}")
+        else:
+            print(f"REGISTER_OK {msg}")
+        sys.exit(0)
+    else:
+        print(f"REGISTER_ERR {result['message']}")
+        sys.exit(2)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Unified Compute Host Agent")
+    parser.add_argument(
+        "--register", action="store_true", help="Register this device on-chain and exit"
+    )
+    args = parser.parse_args()
+
+    if args.register:
+        asyncio.run(_register_once())
+    else:
+        asyncio.run(_run_agent())
+
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logging.info("\nAgent shut down by user.")
+    main()
