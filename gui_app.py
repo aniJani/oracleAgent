@@ -5,6 +5,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
+import configparser
 
 import requests  # only used for stats if you keep a separate backend; safe otherwise
 from PySide6 import QtCore, QtWidgets, QtGui
@@ -174,11 +175,20 @@ class SimpleMainWindow(QtWidgets.QMainWindow):
         self.btn_stop.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_MediaStop))
         self.btn_stop.setIconSize(QtCore.QSize(24, 24))
 
+        self.btn_settings = QtWidgets.QPushButton("Settings")
+        self.btn_settings.setToolTip("Configure private key and pricing")
+
         btn_row = QtWidgets.QHBoxLayout()
         btn_row.addWidget(self.btn_register)
         btn_row.addWidget(self.btn_start)
         btn_row.addWidget(self.btn_stop)
         control_layout.addLayout(btn_row)
+
+        # Settings button on a separate row
+        settings_row = QtWidgets.QHBoxLayout()
+        settings_row.addWidget(self.btn_settings)
+        settings_row.addStretch(1)
+        control_layout.addLayout(settings_row)
 
         # Optional: show sessions if your separate backend exposes it
         sess_group = QtWidgets.QGroupBox("Status")
@@ -210,6 +220,7 @@ class SimpleMainWindow(QtWidgets.QMainWindow):
         self.btn_register.clicked.connect(self.on_register)
         self.btn_start.clicked.connect(self.on_start)
         self.btn_stop.clicked.connect(self.on_stop)
+        self.btn_settings.clicked.connect(self.on_settings)
 
         # Timer (optional) to poll your separate backend for sessions
         self.timer = QtCore.QTimer(self)
@@ -263,6 +274,26 @@ class SimpleMainWindow(QtWidgets.QMainWindow):
         self.update_ui_for_stop()
         self.log.appendPlainText("\nAgent has been stopped.")
 
+    def on_settings(self):
+        """Open the settings dialog"""
+        try:
+            dialog = SettingsDialog(self)
+            result = dialog.exec()
+
+            if result == QtWidgets.QDialog.Accepted:
+                self.log.appendPlainText("✅ Settings updated successfully")
+                if (
+                    hasattr(self.agent, "proc")
+                    and self.agent.proc
+                    and self.agent.proc.poll() is None
+                ):
+                    self.log.appendPlainText(
+                        "⚠️  Please restart the agent for changes to take effect"
+                    )
+
+        except Exception as e:
+            self.log.appendPlainText(f"❌ Failed to open settings: {e}")
+
     # ---------- Helpers ----------
     def update_ui_for_stop(self):
         self.btn_start.setEnabled(True)
@@ -297,6 +328,193 @@ class SimpleMainWindow(QtWidgets.QMainWindow):
     def on_agent_exit(self, rc: int):
         self.log.appendPlainText(f"\nAgent process exited with code {rc}.")
         self.update_ui_for_stop()
+
+
+class SettingsDialog(QtWidgets.QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Settings")
+        self.setModal(True)
+        self.setFixedSize(500, 300)
+
+        # Load current config
+        self.config_path = PROJECT_ROOT / "config.ini"
+        self.config = configparser.ConfigParser()
+        self.load_current_config()
+
+        self.setup_ui()
+        self.load_values()
+
+    def setup_ui(self):
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(15)
+
+        # Title
+        title = QtWidgets.QLabel("Configuration Settings")
+        title.setObjectName("statusLabel")  # Use existing styling
+        title.setAlignment(QtCore.Qt.AlignCenter)
+        layout.addWidget(title)
+
+        # Form layout
+        form_layout = QtWidgets.QFormLayout()
+        form_layout.setSpacing(15)
+
+        # Private Key field
+        self.private_key_edit = QtWidgets.QLineEdit()
+        self.private_key_edit.setEchoMode(QtWidgets.QLineEdit.Password)
+        self.private_key_edit.setPlaceholderText("Enter your Aptos private key (0x...)")
+
+        # Show/Hide password button
+        key_layout = QtWidgets.QHBoxLayout()
+        key_layout.addWidget(self.private_key_edit)
+
+        self.show_key_btn = QtWidgets.QPushButton("👁")
+        self.show_key_btn.setMaximumWidth(40)
+        self.show_key_btn.setCheckable(True)
+        self.show_key_btn.clicked.connect(self.toggle_password_visibility)
+        key_layout.addWidget(self.show_key_btn)
+
+        key_widget = QtWidgets.QWidget()
+        key_widget.setLayout(key_layout)
+        form_layout.addRow("Private Key:", key_widget)
+
+        # Price per second field
+        self.price_edit = QtWidgets.QSpinBox()
+        self.price_edit.setRange(1, 999999)
+        self.price_edit.setSuffix(" units/second")
+        self.price_edit.setToolTip("Price in smallest currency units per second")
+        form_layout.addRow("Price per Second:", self.price_edit)
+
+        layout.addLayout(form_layout)
+
+        # Help text
+        help_text = QtWidgets.QLabel(
+            "• Private Key: Your Aptos wallet private key (starts with 0x)\n"
+            "• Price per Second: How much you charge per second of GPU usage"
+        )
+        help_text.setStyleSheet("color: #9aa5ce; font-size: 12px;")
+        help_text.setWordWrap(True)
+        layout.addWidget(help_text)
+
+        layout.addStretch()
+
+        # Buttons
+        button_layout = QtWidgets.QHBoxLayout()
+
+        self.save_btn = QtWidgets.QPushButton("Save")
+        self.save_btn.clicked.connect(self.save_config)
+
+        self.cancel_btn = QtWidgets.QPushButton("Cancel")
+        self.cancel_btn.clicked.connect(self.reject)
+
+        button_layout.addStretch()
+        button_layout.addWidget(self.cancel_btn)
+        button_layout.addWidget(self.save_btn)
+
+        layout.addLayout(button_layout)
+
+    def load_current_config(self):
+        """Load the current configuration file"""
+        try:
+            if self.config_path.exists():
+                self.config.read(self.config_path)
+            else:
+                # Create default sections if file doesn't exist
+                self.config.add_section("aptos")
+                self.config.add_section("host")
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(
+                self, "Config Error", f"Error loading config: {e}"
+            )
+
+    def load_values(self):
+        """Load current values into the form"""
+        try:
+            # Load private key
+            if self.config.has_option("aptos", "private_key"):
+                private_key = self.config.get("aptos", "private_key")
+                self.private_key_edit.setText(private_key)
+
+            # Load price per second
+            if self.config.has_option("host", "price_per_second"):
+                price = self.config.getint("host", "price_per_second")
+                self.price_edit.setValue(price)
+            else:
+                self.price_edit.setValue(1)  # Default value
+
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(
+                self, "Load Error", f"Error loading values: {e}"
+            )
+
+    def toggle_password_visibility(self):
+        """Toggle password visibility for private key field"""
+        if self.show_key_btn.isChecked():
+            self.private_key_edit.setEchoMode(QtWidgets.QLineEdit.Normal)
+            self.show_key_btn.setText("🙈")
+        else:
+            self.private_key_edit.setEchoMode(QtWidgets.QLineEdit.Password)
+            self.show_key_btn.setText("👁")
+
+    def validate_private_key(self, key):
+        """Basic validation for private key format"""
+        if not key:
+            return False, "Private key cannot be empty"
+
+        if not key.startswith("0x"):
+            return False, "Private key must start with '0x'"
+
+        if len(key) != 66:  # 0x + 64 hex characters
+            return False, "Private key must be 66 characters long (0x + 64 hex chars)"
+
+        try:
+            int(key, 16)  # Check if it's valid hex
+        except ValueError:
+            return False, "Private key must contain only valid hexadecimal characters"
+
+        return True, ""
+
+    def save_config(self):
+        """Save the configuration to file"""
+        try:
+            # Get values from form
+            private_key = self.private_key_edit.text().strip()
+            price_per_second = self.price_edit.value()
+
+            # Validate private key
+            is_valid, error_msg = self.validate_private_key(private_key)
+            if not is_valid:
+                QtWidgets.QMessageBox.warning(self, "Validation Error", error_msg)
+                return
+
+            # Ensure sections exist
+            if not self.config.has_section("aptos"):
+                self.config.add_section("aptos")
+            if not self.config.has_section("host"):
+                self.config.add_section("host")
+
+            # Update only the specified values
+            self.config.set("aptos", "private_key", private_key)
+            self.config.set("host", "price_per_second", str(price_per_second))
+
+            # Write to file
+            with open(self.config_path, "w", encoding="utf-8") as f:
+                self.config.write(f)
+
+            QtWidgets.QMessageBox.information(
+                self,
+                "Settings Saved",
+                "Configuration has been saved successfully!\n\n"
+                "Restart the agent for changes to take effect.",
+            )
+
+            self.accept()
+
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(
+                self, "Save Error", f"Failed to save configuration:\n{str(e)}"
+            )
 
 
 def main():
