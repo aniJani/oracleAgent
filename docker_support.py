@@ -1,9 +1,11 @@
+# docker_runtime.py
+
 import os
 import shlex
 import subprocess
 import logging
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple, Union
 
 log = logging.getLogger("host-agent.docker")
 
@@ -43,7 +45,7 @@ class DockerRuntime:
             if r.returncode != 0:
                 raise RuntimeError(f"Docker pull failed: {r.stderr.strip()}")
 
-    def _container_name(self, job_id: int | str) -> str:
+    def _container_name(self, job_id: Union[int, str]) -> str:
         return f"{_PREFIX}{job_id}"
 
     def start_jupyter(
@@ -68,19 +70,18 @@ class DockerRuntime:
         job_dir = (SESSIONS_ROOT / str(job_id)).resolve()
         job_dir.mkdir(parents=True, exist_ok=True)
 
-        # --- Classic Notebook bootstrap (no Lab) ---
-        bootstrap = " && ".join(
-            [
-                "python -m pip install --no-cache-dir --upgrade pip",
-                "python - <<'PY'\n"
-                "import importlib.util, sys\n"
-                "sys.exit(0 if importlib.util.find_spec('notebook') else 1)\n"
-                "PY\n"
-                " || python -m pip install --no-cache-dir 'notebook==6.5.*'",
-                "python -m notebook --ip=0.0.0.0 --port=8888 --no-browser "
-                "--NotebookApp.token='' --NotebookApp.password='' "
-                "--NotebookApp.allow_origin='*' --NotebookApp.disable_check_xsrf=True",
-            ]
+        # --- FIX: Robust bootstrap command using a standard 'if' statement ---
+        # This is a much safer way to conditionally install a package in bash,
+        # avoiding the syntax errors caused by the previous multi-line '||' chain.
+        bootstrap = (
+            "python -m pip install --no-cache-dir --upgrade pip && "
+            "if ! python -c \"import importlib.util; exit(0 if importlib.util.find_spec('notebook') else 1)\"; then "
+            "    echo 'Jupyter Notebook not found, installing notebook==6.5.*...'; "
+            "    python -m pip install --no-cache-dir 'notebook==6.5.*'; "
+            "fi && "
+            "python -m notebook --ip=0.0.0.0 --port=8888 --no-browser "
+            "--NotebookApp.token='' --NotebookApp.password='' "
+            "--NotebookApp.allow_origin='*' --NotebookApp.disable_check_xsrf=True --allow-root"
         )
 
         cmd: List[str] = [
@@ -107,11 +108,14 @@ class DockerRuntime:
             for k, v in envs.items():
                 cmd += ["-e", f"{k}={v}"]
 
-        cmd += [self.image, "bash", "-lc", bootstrap]
+        # FIX: Use 'bash -c' to execute the command string directly
+        cmd += [self.image, "bash", "-c", bootstrap]
 
         self.ensure_image()
         r = self._run(cmd)
         if r.returncode != 0:
+            # Provide more context on failure
+            log.error(f"Docker run command failed. Stderr:\n{r.stderr.strip()}")
             raise RuntimeError(f"Docker run failed: {r.stderr.strip()}")
 
         cid = r.stdout.strip()

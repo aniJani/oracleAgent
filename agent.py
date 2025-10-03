@@ -11,7 +11,8 @@ import shlex
 import socket
 from pathlib import Path
 from typing import Optional, Dict
-
+from docker_support import DockerRuntime
+from stats import StatsMonitor
 # ---- Aptos SDK ----
 from aptos_sdk.account import Account
 from aptos_sdk.async_client import RestClient
@@ -75,71 +76,6 @@ def _wait_http_ready(url: str, timeout: float = 60.0) -> bool:
 
 
 # ---------------------------- runtime managers ----------------------------
-class DockerRuntime:
-    def __init__(self):
-        self.bin = os.environ.get("DOCKER_BIN", "docker")
-
-    def _run(self, cmd: str) -> subprocess.CompletedProcess:
-        log.info("[docker] %s", cmd)
-        return subprocess.run(
-            shlex.split(cmd), capture_output=True, text=True, check=False
-        )
-
-    def ensure_image(self, image: str) -> None:
-        # pull if not present
-        r = self._run(f"{self.bin} image inspect {image}")
-        if r.returncode != 0:
-            log.info(f"Pulling Docker image: {image}")
-            r = self._run(f"{self.bin} pull {image}")
-            if r.returncode != 0:
-                raise RuntimeError(f"Docker pull failed: {r.stderr.strip()}")
-
-    def start_jupyter(self, job_id: int, image: str, host_port: int, token: str) -> str:
-        """
-        Start a classic Jupyter Notebook server inside the container, expose host_port.
-        Returns container_id.
-        """
-        name = f"{CONTAINER_NAME_PREFIX}{job_id}"
-        # Stop/remove any old
-        self._run(f"{self.bin} rm -f {name}")
-
-        # --- Classic Notebook bootstrap (no Lab) ---
-        bootstrap = " && ".join(
-            [
-                "python -m pip install --no-cache-dir --upgrade pip",
-                # install classic notebook if absent
-                "python - <<'PY'\n"
-                "import importlib.util, sys\n"
-                "sys.exit(0 if importlib.util.find_spec('notebook') else 1)\n"
-                "PY\n"
-                " || python -m pip install --no-cache-dir 'notebook==6.5.*'",
-                # launch notebook (no token/password)
-                "python -m notebook --ip=0.0.0.0 --port=8888 --no-browser "
-                "--NotebookApp.token='' --NotebookApp.password='' "
-                "--NotebookApp.allow_origin='*' --NotebookApp.disable_check_xsrf=True",
-                "--allow-root"
-            ]
-        )
-
-        cmd = (
-            f"{self.bin} run -d --gpus all --name {name} "
-            f"-p {host_port}:8888 "
-            f"{image} "
-            f"bash -lc {shlex.quote(bootstrap)}"
-        )
-        r = self._run(cmd)
-        if r.returncode != 0:
-            raise RuntimeError(f"Docker run failed: {r.stderr.strip()}")
-        container_id = r.stdout.strip()
-        if not container_id:
-            raise RuntimeError("Docker run returned empty container ID")
-        log.info(f"Container started: {container_id} ({name}) on :{host_port}")
-        return container_id
-
-    def stop(self, job_id: int) -> None:
-        name = f"{CONTAINER_NAME_PREFIX}{job_id}"
-        self._run(f"{self.bin} rm -f {name}")
-
 
 class TunnelRuntime:
     def __init__(self, bin_path: Optional[str] = None):
@@ -237,6 +173,16 @@ class HostAgent:
         self.docker = DockerRuntime()
         self.tunnel = TunnelRuntime()
 
+        self.stats_monitor = StatsMonitor()
+        self.monitoring_tasks: Dict[int, asyncio.Task] = {}
+        self.nvml_handle = None
+        try:
+            pynvml.nvmlInit()
+            self.nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            log.info("✅ NVML initialized globally for stats monitoring.")
+        except pynvml.NVMLError as e:
+            log.warning(f"Could not initialize NVML for stats monitoring: {e}")
+
         # ---- Session state by job_id ----
         self.sessions: Dict[int, Dict] = {}
 
@@ -244,17 +190,24 @@ class HostAgent:
     # Registration (direct on-chain)
     # -------------------------------------------------------------------------
     def _detect_specs(self) -> dict:
-        """Detect GPU/CPU/RAM for registration."""
         specs = {}
-        pynvml.nvmlInit()
+        handle_is_temporary = False
         try:
-            handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            if self.nvml_handle:
+                handle = self.nvml_handle
+            else:
+                pynvml.nvmlInit()
+                handle_is_temporary = True
+                handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            
             name = pynvml.nvmlDeviceGetName(handle)
             if isinstance(name, bytes):
                 name = name.decode("utf-8")
             specs["gpu_model"] = str(name)
         finally:
-            pynvml.nvmlShutdown()
+            if handle_is_temporary:
+                pynvml.nvmlShutdown() # Only shut down if we opened it just for this
+        
         specs["cpu_cores"] = int(psutil.cpu_count(logical=True))
         specs["ram_gb"] = int(round(psutil.virtual_memory().total / (1024**3)))
         return specs
@@ -341,22 +294,34 @@ class HostAgent:
             with contextlib.suppress(Exception):
                 self._stop_session_sync(job_id)
         log.info("✅ Shutdown complete.")
+        if self.nvml_handle:
+            try:
+                pynvml.nvmlShutdown()
+                log.info("✅ NVML shut down.")
+            except pynvml.NVMLError:
+                pass
 
     # -------------------------------------------------------------------------
     # Session lifecycle (by job_id)
     # -------------------------------------------------------------------------
     def _start_session_sync(self, job_id: int, image: Optional[str] = None) -> Dict:
+        # The 'image' variable is now unused because DockerRuntime uses the image
+        # it was configured with during initialization.
         image = image or PYTORCH_IMAGE
-        self.docker.ensure_image(image)
+        
+        # FIX #1: Call ensure_image() with no arguments.
+        self.docker.ensure_image()
 
         port = _free_tcp_port()
         token = os.environ.get("JUPYTER_TOKEN", f"token-{job_id}-{int(time.time())}")
 
+        # FIX #2: Remove the 'image=image' argument from the call.
         container_id = self.docker.start_jupyter(
-            job_id=job_id, image=image, host_port=port, token=token
+            job_id=job_id, host_port=port, token=token
         )
 
-        if not _wait_http_ready(f"http://127.0.0.1:{port}", timeout=180):
+        # The rest of the function is correct.
+        if not _wait_http_ready(f"http://127.0.0.1:{port}", timeout=300):
             self.docker.stop(job_id)
             raise RuntimeError("Jupyter did not become ready in time")
 
@@ -375,83 +340,58 @@ class HostAgent:
         return session
 
     def _stop_session_sync(self, job_id: int) -> None:
+        task = self.monitoring_tasks.pop(job_id, None)
+        if task and not task.done():
+            task.cancel()
+            log.info(f"Cancelled stats monitoring for job {job_id}.")
+
         self.tunnel.stop(job_id)
         self.docker.stop(job_id)
         self.sessions.pop(job_id, None)
-
+    
     async def _handle_start_session(self, ws, msg: dict):
         job_id = msg.get("job_id")
         image = msg.get("image") or PYTORCH_IMAGE
         if not isinstance(job_id, int):
-            await ws.send(
-                json.dumps(
-                    {"status": "error", "error": "invalid_job_id", "detail": str(job_id)}
-                )
-            )
+            await ws.send(json.dumps({"status": "error", "error": "invalid_job_id", "detail": str(job_id)}))
             return
         if job_id in self.sessions:
-            s = self.sessions[job_id]
-            await ws.send(
-                json.dumps(
-                    {
-                        "status": "session_ready",
-                        "job_id": job_id,
-                        "public_url": s["public_url"],
-                        "token": s["token"],
-                    }
-                )
-            )
+            await ws.send(json.dumps({"status": "session_ready", "job_id": job_id, "public_url": self.sessions[job_id]["public_url"], "token": self.sessions[job_id]["token"]}))
             return
-
         try:
-            s = self._start_session_sync(job_id=job_id, image=image)
-            await ws.send(
-                json.dumps(
-                    {
-                        "status": "session_ready",
-                        "job_id": job_id,
-                        "public_url": s["public_url"],
-                        "token": s["token"],
-                    }
+            log.info(f"Starting session for job {job_id} in background thread...")
+            s = await asyncio.to_thread(self._start_session_sync, job_id=job_id, image=image)
+            log.info(f"Background session start for job {job_id} completed successfully.")
+            await ws.send(json.dumps({"status": "session_ready", "job_id": job_id, "public_url": s["public_url"], "token": s["token"]}))
+            if self.nvml_handle:
+                log.info(f"Starting GPU stats monitoring for job {job_id}.")
+                monitor_task = asyncio.create_task(
+                    self.stats_monitor.monitor_gpu(
+                        job_id=job_id,
+                        nvml_handle=self.nvml_handle,
+                        active_containers=self.sessions,
+                        websocket=ws,
+                        monitoring_tasks=self.monitoring_tasks
+                    )
                 )
-            )
+                self.monitoring_tasks[job_id] = monitor_task
         except Exception as e:
-            log.error(f"start_session failed for job {job_id}: {e}")
-            await ws.send(
-                json.dumps(
-                    {
-                        "status": "error",
-                        "job_id": job_id,
-                        "error": "start_failed",
-                        "detail": str(e),
-                    }
-                )
-            )
+            log.error(f"start_session failed for job {job_id}: {e}", exc_info=True)
+            await ws.send(json.dumps({"status": "error", "job_id": job_id, "error": "start_failed", "detail": str(e)}))
 
     async def _handle_stop_session(self, ws, msg: dict):
         job_id = msg.get("job_id")
         if not isinstance(job_id, int):
-            await ws.send(
-                json.dumps(
-                    {"status": "error", "error": "invalid_job_id", "detail": str(job_id)}
-                )
-            )
+            await ws.send(json.dumps({"status": "error", "error": "invalid_job_id", "detail": str(job_id)}))
             return
         try:
             self._stop_session_sync(job_id)
             await ws.send(json.dumps({"status": "session_stopped", "job_id": job_id}))
         except Exception as e:
             log.error(f"stop_session failed for job {job_id}: {e}")
-            await ws.send(
-                json.dumps(
-                    {
-                        "status": "error",
-                        "job_id": job_id,
-                        "error": "stop_failed",
-                        "detail": str(e),
-                    }
-                )
-            )
+            await ws.send(json.dumps({"status": "error", "job_id": job_id, "error": "stop_failed", "detail": str(e)}))
+
+
 
     # -------------------------------------------------------------------------
     # Backend WebSocket loop
