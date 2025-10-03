@@ -14,6 +14,7 @@ import docker
 import psutil
 import requests
 import websockets
+import threading
 
 from aptos_sdk.account import Account
 from aptos_sdk.async_client import ApiError, RestClient
@@ -70,21 +71,33 @@ class HostAgent:
         self.price_per_second = int(config["host"]["price_per_second"])
 
         # --- Runtime state ---
-        self.active_jobs: Set[int] = set()
-        self.active_containers: Dict[int, str] = {}  # job_id -> container_id
-        self.docker_client: Optional[docker.DockerClient] = None
+        self.active_jobs = set()
+        self.active_containers = {}  # job_id -> container_id
+        self.docker_client = None  # set by ensure_docker()
         self.transaction_lock = asyncio.Lock()
-        self.monitoring_tasks: Dict[int, asyncio.Task] = {}
-        self.active_tunnels: Dict[int, Dict[str, Any]] = {}
+        self.monitoring_tasks = {}
+        self.active_tunnels = {}
+        # Local control queue for GUI/API commands
+        self._local_commands = asyncio.Queue()
+        self._control_server = None
+        self._control_thread = None
+        self._loop = None
+        # For correlating control_api responses when WS is not directly involved
+        self._local_results = {}
+        self._result_cond = threading.Condition()
 
         # track per-job session start timestamp (for final_session_duration)
-        self.session_start_times: Dict[int, float] = {}  # job_id -> start_timestamp
+        self.session_start_times = {}  # job_id -> start_timestamp
 
         # track per-job token so we can re-announce on resume
-        self._tokens: Dict[int, str] = {}
+        self._tokens = {}
 
         # track per-job Jupyter base_url prefix (for resume)
-        self._base_prefix: Dict[int, str] = {}
+        self._base_prefix = {}
+
+        # Track per-user active session mappings for one-session-per-user enforcement
+        self._user_sessions: Dict[str, int] = {}  # renter_address -> job_id
+        self._job_renter: Dict[int, str] = {}  # job_id -> renter_address
 
         logging.info(f"Host Agent loaded for account: {self.host_account.address()}")
 
@@ -108,6 +121,17 @@ class HostAgent:
         self.chain_client.active_jobs = self.active_jobs
         self.chain_client.stop_container_callback = self._stop_container
         self.chain_client.session_start_times = self.session_start_times
+
+    def enqueue_local_command(self, command: Dict[str, Any]) -> None:
+        """Thread-safe way to push a local command into the agent loop."""
+        if self._loop is None:
+            # Agent not fully started yet; drop or handle later
+            logging.warning("Local command received before agent loop ready; dropping.")
+            return
+        try:
+            self._loop.call_soon_threadsafe(self._local_commands.put_nowait, command)
+        except Exception as e:
+            logging.error(f"Failed to enqueue local command {command}: {e}")
 
     # ---------- signal / shutdown ----------
     def _handle_signal(self, signum, frame):
@@ -225,6 +249,7 @@ class HostAgent:
         try:
             # Defer to stats monitor if needed (kept for backward compatibility)
             import pynvml
+
             pynvml.nvmlInit()
             handle = pynvml.nvmlDeviceGetHandleByIndex(0)
             gpu_model = pynvml.nvmlDeviceGetName(handle)
@@ -249,6 +274,7 @@ class HostAgent:
         logging.info(f"📊 Starting stats monitoring for Job ID: {job_id}")
         try:
             import pynvml
+
             pynvml.nvmlInit()
             handle = pynvml.nvmlDeviceGetHandleByIndex(0)
             while job_id in self.active_containers:
@@ -286,6 +312,7 @@ class HostAgent:
         finally:
             try:
                 import pynvml  # type: ignore
+
                 pynvml.nvmlShutdown()
             except Exception:
                 pass
@@ -394,7 +421,13 @@ class HostAgent:
                 }
             else:
                 from pyngrok import ngrok as _ng
-                tunnel = _ng.connect(addr=host_port, proto="http", auth=f"{edge_user}:{edge_pass}", inspect=False)
+
+                tunnel = _ng.connect(
+                    addr=host_port,
+                    proto="http",
+                    auth=f"{edge_user}:{edge_pass}",
+                    inspect=False,
+                )
                 public_url = tunnel.public_url.rstrip("/") + base_prefix
                 public_url = with_basic_auth(public_url, edge_user, edge_pass)
                 self.active_tunnels[job_id] = {
@@ -407,11 +440,12 @@ class HostAgent:
                 f"✅ Secure tunnel created for job {job_id}: {self.active_tunnels[job_id]['public_url']}"
             )
 
-            # Launch background GPU monitor
-            task = asyncio.create_task(
-                self._monitor_and_report_stats(job_id, websocket)
-            )
-            self.monitoring_tasks[job_id] = task
+            # Launch background GPU monitor only when a backend websocket is present
+            if websocket is not None:
+                task = asyncio.create_task(
+                    self._monitor_and_report_stats(job_id, websocket)
+                )
+                self.monitoring_tasks[job_id] = task
 
             # Save state again (optional)
             self._save_state()
@@ -451,6 +485,7 @@ class HostAgent:
                         logging.info(f"🛑 Disconnecting ngrok tunnel: {url}")
                         try:
                             from pyngrok import ngrok as _ng
+
                             _ng.disconnect(url)
                         except Exception as e:
                             logging.warning(f"ngrok disconnect warning: {e}")
@@ -483,13 +518,22 @@ class HostAgent:
         self._tokens.pop(job_id, None)
         self._base_prefix.pop(job_id, None)
 
+        # Clear renter mapping for one-session-per-user enforcement
+        renter = self._job_renter.pop(job_id, None)
+        if renter and self._user_sessions.get(renter) == job_id:
+            self._user_sessions.pop(renter, None)
+            logging.info(f"📝 Cleared mapping for renter {renter} (job {job_id})")
+
         # Persist new state
         self._save_state()
 
     # ---------- state helpers ----------
     def _state_snapshot(self) -> dict:
         return self.state_manager.snapshot(
-            self.active_containers, self._tokens, self.session_start_times, self._base_prefix
+            self.active_containers,
+            self._tokens,
+            self.session_start_times,
+            self._base_prefix,
         )
 
     def _save_state(self) -> None:
@@ -604,7 +648,13 @@ class HostAgent:
                     edge_user = "uc"
                     edge_pass = secrets.token_urlsafe(24)
                     from pyngrok import ngrok as _ng
-                    tunnel = _ng.connect(addr=host_port, proto="http", auth=f"{edge_user}:{edge_pass}", inspect=False)
+
+                    tunnel = _ng.connect(
+                        addr=host_port,
+                        proto="http",
+                        auth=f"{edge_user}:{edge_pass}",
+                        inspect=False,
+                    )
                     public_url = tunnel.public_url.rstrip("/") + base_prefix
                     public_url = with_basic_auth(public_url, edge_user, edge_pass)
                     self.active_tunnels[job_id] = {
@@ -618,6 +668,20 @@ class HostAgent:
                     self._monitor_and_report_stats(job_id, websocket)
                 )
                 self.monitoring_tasks[job_id] = task
+
+                # Rebuild renter mapping on resume (best-effort)
+                try:
+                    renter = await self._get_job_renter(job_id)
+                    if renter:
+                        self._user_sessions[renter] = job_id
+                        self._job_renter[job_id] = renter
+                        logging.info(
+                            f"📝 Restored mapping for renter {renter} to job {job_id}"
+                        )
+                except Exception as e:
+                    logging.warning(
+                        f"Could not restore renter mapping for job {job_id}: {e}"
+                    )
 
                 # re-emit session_ready so backend fills SESSION_CACHE
                 msg = {
@@ -640,24 +704,168 @@ class HostAgent:
             except Exception as e:
                 logging.error(f"Failed to resume job {job_id}: {e}", exc_info=True)
 
+    async def _get_job_renter(self, job_id: int) -> Optional[str]:
+        """
+        Best-effort fetch of renter address for a job from chain.
+        Falls back to None if field names differ or lookup fails.
+        """
+        try:
+            raw = await self.rest_client.view(
+                function=f"{self.contract_address}::escrow::get_job",
+                type_arguments=[],
+                arguments=[str(job_id)],
+            )
+            parsed = json.loads(raw.decode("utf-8"))
+            if not parsed or not isinstance(parsed[0], dict):
+                return None
+            job = parsed[0]
+            # Try common key names for renter address
+            return (
+                job.get("renter") or job.get("renter_address") or job.get("renter_addr")
+            )
+        except Exception:
+            return None
+
+    async def _process_command(self, command: Dict[str, Any], websocket) -> None:
+        """Handle a single command dict, same shape as backend sends."""
+        try:
+            action = command.get("action")
+            job_id = command.get("job_id")
+            correlation_id = command.get("correlation_id")
+
+            if job_id is None:
+                return
+            if isinstance(job_id, str):
+                try:
+                    job_id = int(job_id)
+                except ValueError:
+                    logging.warning(f"Ignoring command with non-int job_id: {job_id!r}")
+                    return
+
+            if action == "start_session":
+                # Resolve renter (prefer from command, else query chain)
+                renter = command.get("renter") or command.get("renter_address")
+                if renter is None:
+                    renter = await self._get_job_renter(job_id)
+
+                # Enforce one active session per renter
+                if renter and renter in self._user_sessions:
+                    existing_job = self._user_sessions[renter]
+                    if (
+                        existing_job != job_id
+                        and existing_job in self.active_containers
+                    ):
+                        resp = {
+                            "status": "session_error",
+                            "job_id": job_id,
+                            "error": "user_already_active",
+                            "message": f"User already has an active session (Job ID: {existing_job}). Only one session per user is allowed.",
+                        }
+                        if websocket is not None:
+                            await websocket.send(json.dumps(resp))
+                            logging.info(
+                                f"⬆️ Rejected start for job {job_id}: renter {renter} already has active session {existing_job}."
+                            )
+                        if correlation_id:
+                            with self._result_cond:
+                                self._local_results[correlation_id] = resp
+                                self._result_cond.notify_all()
+                        return
+
+                details = self._start_container(job_id, websocket)
+                resp = {
+                    "status": ("session_ready" if details else "session_error"),
+                    "job_id": job_id,
+                }
+                if details:
+                    resp.update(
+                        {
+                            "public_url": details["public_url"],
+                            "token": details["token"],
+                        }
+                    )
+                    # Record renter mapping only on success
+                    if renter:
+                        self._user_sessions[renter] = job_id
+                        self._job_renter[job_id] = renter
+                        logging.info(f"📝 Mapped renter {renter} to job {job_id}")
+
+                if websocket is not None:
+                    await websocket.send(json.dumps(resp))
+                    logging.info(f"⬆️ Sent session details for job {job_id} to backend.")
+                if correlation_id:
+                    with self._result_cond:
+                        self._local_results[correlation_id] = resp
+                        self._result_cond.notify_all()
+
+            elif action == "stop_session":
+                self._stop_container(job_id)
+                resp = {"status": "session_stopped", "job_id": job_id}
+                if websocket is not None:
+                    await websocket.send(json.dumps(resp))
+                    logging.info(
+                        f"⬆️ Sent session stopped confirmation for job {job_id}."
+                    )
+                if correlation_id:
+                    with self._result_cond:
+                        self._local_results[correlation_id] = resp
+                        self._result_cond.notify_all()
+
+            else:
+                logging.warning(f"Unknown action: {action}")
+        except Exception as e:
+            logging.error(f"Error processing command {command}: {e}", exc_info=True)
+
     # ---------- Env/chain helpers ----------
     async def get_on_chain_listings(self) -> Dict[int, Any]:
+        """
+        Fetch existing listings for this host account.
+        Returns dict of listings, or raises exception if query fails unexpectedly.
+        """
         try:
-            resource_type = f"{self.contract_address}::marketplace::ListingManager}}"
+            # Fix typo: remove extra closing brace
+            resource_type = f"{self.contract_address}::marketplace::ListingManager"
             response = await self.rest_client.account_resource(
                 str(self.host_account.address()), resource_type
             )
             listings_data = response.get("data", {}).get("listings", [])
-            return {int(l["id"]): l for l in listings_data}
-        except Exception:
-            return {}
+            result = {int(l["id"]): l for l in listings_data}
+            logging.info(f"📋 Found {len(result)} existing listing(s) for this host.")
+            return result
+        except ApiError as e:
+            # Resource not found = no listings yet (this is OK)
+            if "resource not found" in str(e).lower() or e.status_code == 404:
+                logging.info("📋 No ListingManager resource found (no listings yet).")
+                return {}
+            # Other API errors should be logged and raised
+            logging.error(f"API error fetching listings: {e}", exc_info=True)
+            raise
+        except Exception as e:
+            logging.error(f"Unexpected error fetching listings: {e}", exc_info=True)
+            raise
 
     async def register_on_chain_if_needed(self, specs: Dict[str, Any]) -> None:
-        existing = await self.get_on_chain_listings()
-        if existing:
-            logging.info("Host already has listing(s) on-chain. Skipping registration.")
+        """
+        Register host on-chain only if:
+        1. We can successfully query listings
+        2. AND no listings exist for this host
+        """
+        try:
+            existing = await self.get_on_chain_listings()
+        except Exception as e:
+            logging.error(f"Cannot verify existing listings due to error: {e}")
+            logging.warning(
+                "⚠️ Skipping registration to avoid duplicate listing errors."
+            )
             return
 
+        if existing:
+            logging.info(
+                f"✅ Host already has {len(existing)} listing(s) on-chain. Skipping registration."
+            )
+            return
+
+        # Proceed with registration logic...
         if specs["is_physical"]:
             function_name = "list_physical_machine"
             cpu_cores = int(specs.get("cpu_cores", 1))
@@ -691,9 +899,19 @@ class HostAgent:
                 f"{self.contract_address}::marketplace", function_name, [], arguments
             )
         )
-        await self.submit_transaction(
-            payload, f"✅ Successfully listed '{specs['identifier']}' on-chain!"
-        )
+
+        try:
+            await self.submit_transaction(
+                payload, f"✅ Successfully listed '{specs['identifier']}' on-chain!"
+            )
+        except Exception as e:
+            if "E_MAX_LISTINGS_REACHED" in str(e):
+                logging.warning(
+                    "⚠️ Contract has reached max listings. Your host is likely already registered."
+                )
+            else:
+                logging.error(f"Failed to register on-chain: {e}", exc_info=True)
+                raise
 
     # ---------- Claim loop ----------
     async def claim_payment_for_job(self, job_id: int) -> None:
@@ -896,60 +1114,33 @@ class HostAgent:
                     backoff = 3  # reset backoff
 
                     while True:
-                        message_raw = await websocket.recv()
-                        try:
-                            command = json.loads(message_raw)
-                        except json.JSONDecodeError:
-                            logging.warning(
-                                f"Received non-JSON message: {message_raw!r}"
-                            )
-                            continue
-
-                        logging.info(f"⬇️ Received command from backend: {command}")
-                        action = command.get("action")
-                        job_id = command.get("job_id")
-
-                        if job_id is None:
-                            continue
-                        if isinstance(job_id, str):
+                        # Wait on either backend message or local API command
+                        recv_task = asyncio.create_task(websocket.recv())
+                        local_task = asyncio.create_task(self._local_commands.get())
+                        done, pending = await asyncio.wait(
+                            {recv_task, local_task}, return_when=asyncio.FIRST_COMPLETED
+                        )
+                        # Backend message
+                        if recv_task in done:
+                            message_raw = recv_task.result()
+                            for t in pending:
+                                t.cancel()
                             try:
-                                job_id = int(job_id)
-                            except ValueError:
+                                command = json.loads(message_raw)
+                            except json.JSONDecodeError:
                                 logging.warning(
-                                    f"Ignoring command with non-int job_id: {job_id!r}"
+                                    f"Received non-JSON message: {message_raw!r}"
                                 )
                                 continue
-
-                        if action == "start_session":
-                            details = self._start_container(job_id, websocket)
-                            resp = {
-                                "status": (
-                                    "session_ready" if details else "session_error"
-                                ),
-                                "job_id": job_id,
-                            }
-                            if details:
-                                resp.update(
-                                    {
-                                        "public_url": details["public_url"],
-                                        "token": details["token"],
-                                    }
-                                )
-                            await websocket.send(json.dumps(resp))
-                            logging.info(
-                                f"⬆️ Sent session details for job {job_id} to backend."
-                            )
-
-                        elif action == "stop_session":
-                            self._stop_container(job_id)
-                            resp = {"status": "session_stopped", "job_id": job_id}
-                            await websocket.send(json.dumps(resp))
-                            logging.info(
-                                f"⬆️ Sent session stopped confirmation for job {job_id}."
-                            )
-
-                        else:
-                            logging.warning(f"Unknown action: {action}")
+                            logging.info(f"⬇️ Received command from backend: {command}")
+                            await self._process_command(command, websocket)
+                        # Local command from control API
+                        elif local_task in done:
+                            command = local_task.result()
+                            for t in pending:
+                                t.cancel()
+                            logging.info(f"⬇️ Received local command: {command}")
+                            await self._process_command(command, websocket)
 
             except (
                 websockets.exceptions.ConnectionClosed,
@@ -969,12 +1160,33 @@ class HostAgent:
             await asyncio.sleep(backoff)
             backoff = min(30, int(backoff * 1.7) + 1)
 
+    async def _local_command_loop(self) -> None:
+        """Process locally enqueued commands (from control_api) even without WS."""
+        while True:
+            cmd = await self._local_commands.get()
+            try:
+                await self._process_command(cmd, websocket=None)
+            except Exception as e:
+                logging.error(f"Local command processing error: {e}")
+
     async def run(self) -> None:
         logging.info("--- 🚀 Starting Unified Compute Host Agent ---")
+        # Capture event loop for thread-safe enqueues
+        try:
+            self._loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._loop = None
         self.ensure_docker()
 
         # Load persisted sessions and mark them resumable BEFORE anything else
         self._load_and_prepare_resumes()
+
+        # Start local control API (GUI uses this)
+        try:
+            self._start_control_api()
+            logging.info("🔌 Local control API started at http://127.0.0.1:8765")
+        except Exception as e:
+            logging.warning(f"Control API failed to start: {e}")
 
         specs = self.detect_environment_and_specs()
         self.prepare_base_image()
@@ -986,7 +1198,33 @@ class HostAgent:
 
         polling_task = asyncio.create_task(self.poll_for_jobs())
         command_listener_task = asyncio.create_task(self.listen_for_commands())
-        await asyncio.gather(polling_task, command_listener_task)
+        local_cmd_task = asyncio.create_task(self._local_command_loop())
+        await asyncio.gather(polling_task, command_listener_task, local_cmd_task)
+
+    # ---------- Control API ----------
+    def _start_control_api(self, host: str = "127.0.0.1", port: int = 8765) -> None:
+        """Run FastAPI/uvicorn in a background thread for local control."""
+        try:
+            from control_api import create_app
+            import uvicorn
+        except Exception as e:
+            raise RuntimeError(
+                "FastAPI/uvicorn not installed. Add 'fastapi' and 'uvicorn' to requirements."
+            ) from e
+
+        app = create_app(self)
+        config = uvicorn.Config(app, host=host, port=port, log_level="warning")
+        server = uvicorn.Server(config)
+        self._control_server = server
+
+        def _run_server():
+            try:
+                server.run()
+            except Exception:
+                pass
+
+        self._control_thread = threading.Thread(target=_run_server, daemon=True)
+        self._control_thread.start()
 
 
 # ---------- Entrypoint ----------

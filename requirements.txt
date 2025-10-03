@@ -5,3 +5,6 @@ aptos-sdk
 docker
 websockets
 pyngrok
+pyside6
+fastapi
+uvicorn
