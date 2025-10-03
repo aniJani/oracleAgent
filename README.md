@@ -1,10 +1,16 @@
 # Unified Compute Host Agent
 
+This is part of a 4 repo project:
+SmartContracts: https://github.com/Nishan30/AxessProtocol
+Frontend: https://github.com/Nishan30/AxessProtocolFrontend
+Backend: https://github.com/aniJani/AxessProtocolBackend
+Oracle Agent: https://github.com/aniJani/oracleAgent
+
 This repo runs a GPU host agent that exposes a Jupyter Notebook through a secure tunnel and claims payments on-chain.
 
 ## Prerequisites (Windows)
 - Python 3.10+
-- Docker Desktop (running). For GPU, install NVIDIA driver + NVIDIA Container Toolkit
+- Docker Desktop (running). Cloudflared Installed with the default path, coders can edit the path. For GPU, install NVIDIA driver + NVIDIA Container Toolkit
 - Recommended: `git`, `PowerShell` v5+
 
 ## Setup
