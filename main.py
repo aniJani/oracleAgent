@@ -3,6 +3,7 @@ import asyncio
 import configparser
 import logging
 import sys
+from typing import Dict
 
 from agent import HostAgent
 
@@ -36,11 +37,16 @@ async def _run_agent():
         agent.shutdown()
 
 
-async def _register_once():
+async def _register_once() -> Dict:
+    """
+    Performs the on-chain registration. Returns a result dictionary.
+    This version does NOT exit, making it safe to call from other modules.
+    """
     cfg = load_config()
     agent = HostAgent(cfg)
     result = await agent.register_device_if_needed()
-    # Print a single-line outcome so the GUI can parse/log it
+    
+    # Print a single-line outcome for CLI backward compatibility
     if result["status"] == "ok":
         msg = result["message"]
         tx = result.get("tx_hash")
@@ -48,10 +54,10 @@ async def _register_once():
             print(f"REGISTER_OK tx={tx}")
         else:
             print(f"REGISTER_OK {msg}")
-        sys.exit(0)
     else:
         print(f"REGISTER_ERR {result['message']}")
-        sys.exit(2)
+        
+    return result
 
 
 def main():

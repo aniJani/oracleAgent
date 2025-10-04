@@ -1,3 +1,4 @@
+import asyncio
 import os
 import sys
 import json
@@ -9,6 +10,7 @@ import configparser
 
 import requests  # only used for stats if you keep a separate backend; safe otherwise
 from PySide6 import QtCore, QtWidgets, QtGui
+from main import _register_once, load_config
 
 # If you already have constants.py with STATE_FILE, import it; else define a temp path
 try:
@@ -16,7 +18,10 @@ try:
 except ImportError:
     STATE_FILE = Path(os.getenv("TEMP", "/tmp")) / "gpu_rental_state.json"
 
-PROJECT_ROOT = Path(__file__).resolve().parent
+if getattr(sys, 'frozen', False):
+    APP_ROOT = Path(sys.executable).parent.resolve()
+else:
+    APP_ROOT = Path(__file__).resolve().parent
 
 # If you have a separate backend for listings/sessions, you can point to it here.
 # The GUI no longer needs a local uvicorn control API.
@@ -75,7 +80,7 @@ class AgentProcess(QtCore.QObject):
         self._stop_reader.clear()
         self.proc = subprocess.Popen(
             [sys.executable, "-u", "main.py"],  # run agent loop
-            cwd=str(PROJECT_ROOT),
+            cwd=str(APP_ROOT),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -231,29 +236,71 @@ class SimpleMainWindow(QtWidgets.QMainWindow):
         self.update_ui_for_stop()
 
     # ---------- Actions ----------
-    def on_register(self):
-        self.log.appendPlainText("Registering device on-chain...")
+    async def _register_once() -> Dict:
+        """
+        Performs the on-chain registration. Returns a result dictionary.
+        This version does NOT exit, making it safe to call from other modules.
+        """
         try:
-            # Run agent registration path and stream output
-            proc = subprocess.Popen(
-                [sys.executable, "-u", "main.py", "--register"],
-                cwd=str(PROJECT_ROOT),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-                universal_newlines=True,
-            )
-            for line in proc.stdout or []:
-                self.log.appendPlainText(line.rstrip("\n"))
-            rc = proc.wait()
-            if rc == 0:
-                self.log.appendPlainText("✅ Registration complete.")
-                self.btn_register.setEnabled(False)  # one-time
-            else:
-                self.log.appendPlainText("❌ Registration failed. See logs above.")
+            cfg = load_config() # This can call sys.exit(), which raises SystemExit
+            agent = HostAgent(cfg)
+            result = await agent.register_device_if_needed()
+        except SystemExit as e:
+            # Catch the exit from load_config and turn it into a proper error result
+            result = {"status": "error", "message": "Failed to load config.ini. Please check the file and ensure all required keys are present."}
         except Exception as e:
-            self.log.appendPlainText(f"Registration error: {e}")
+            result = {"status": "error", "message": f"An unexpected error occurred: {e}"}
+
+        # Print a single-line outcome for CLI backward compatibility
+        if result["status"] == "ok":
+            msg = result["message"]
+            tx = result.get("tx_hash")
+            if tx: print(f"REGISTER_OK tx={tx}")
+            else: print(f"REGISTER_OK {msg}")
+        else:
+            print(f"REGISTER_ERR {result['message']}")
+            
+        return result
+
+    def _run_registration_task(self):
+        """
+        This function runs in a background thread. It loads the config
+        and then executes the async _register_once function.
+        """
+        try:
+            # First, try to load the config to catch errors early
+            load_config() 
+            # asyncio.run() creates a new event loop and runs the task.
+            result = asyncio.run(_register_once())
+            
+            # Use a signal to safely update the GUI from this background thread
+            QtCore.QMetaObject.invokeMethod(self, "_on_registration_complete", QtCore.Qt.QueuedConnection, QtCore.Q_ARG(dict, result))
+        except Exception as e:
+            # Handle errors like a missing or invalid config.ini
+            error_result = {"status": "error", "message": str(e)}
+            QtCore.QMetaObject.invokeMethod(self, "_on_registration_complete", QtCore.Qt.QueuedConnection, QtCore.Q_ARG(dict, error_result))
+
+    @QtCore.Slot(dict, str) # <-- MODIFIED: Accept a string argument for logs
+    def _on_registration_complete(self, result: dict, logs: str):
+        """
+        This function is a Qt Slot. It is safely called on the main GUI thread
+        to update the UI with the result and logs of the registration task.
+        """
+        # --- ADDED: Log the captured output ---
+        if logs:
+            self.log.appendPlainText("--- Registration Sub-process Output ---")
+            self.log.appendPlainText(logs.strip())
+            self.log.appendPlainText("------------------------------------")
+        # ----------------------------------------
+        
+        if result and result.get("status") == "ok":
+            # The print() from main.py is already in the logs, so just add a summary
+            self.log.appendPlainText(f"✅ Registration process completed successfully.")
+            # Keep the button disabled if it succeeded.
+        else:
+            # The error from main.py is already in the logs, just add a summary
+            self.log.appendPlainText(f"❌ Registration process failed. See output above for details.")
+            self.btn_register.setEnabled(True) # Re-enable the button on failure.
 
     def on_start(self):
         self.log.clear()
@@ -338,7 +385,7 @@ class SettingsDialog(QtWidgets.QDialog):
         self.setFixedSize(500, 300)
 
         # Load current config
-        self.config_path = PROJECT_ROOT / "config.ini"
+        self.config_path = APP_ROOT / "config.ini"
         self.config = configparser.ConfigParser()
         self.load_current_config()
 
@@ -476,7 +523,10 @@ class SettingsDialog(QtWidgets.QDialog):
         return True, ""
 
     def save_config(self):
-        """Save the configuration to file"""
+        """
+        Validates user input and saves it to config.ini.
+        Creates a new, complete config.ini file if one does not exist.
+        """
         try:
             # Get values from form
             private_key = self.private_key_edit.text().strip()
@@ -488,17 +538,32 @@ class SettingsDialog(QtWidgets.QDialog):
                 QtWidgets.QMessageBox.warning(self, "Validation Error", error_msg)
                 return
 
-            # Ensure sections exist
-            if not self.config.has_section("aptos"):
+            # --- NEW LOGIC: Create a full default config if the file is missing ---
+            if not self.config_path.exists():
+                self.config = configparser.ConfigParser()
                 self.config.add_section("aptos")
-            if not self.config.has_section("host"):
+                self.config.set("aptos", "contract_address", "<CHANGE_ME_CONTRACT_ADDRESS>")
+                self.config.set("aptos", "node_url", "https://fullnode.mainnet.aptoslabs.com/v1")
+                self.config.set("aptos", "backend_ws_url", "ws://127.0.0.1:8000/ws")
+                
                 self.config.add_section("host")
 
-            # Update only the specified values
+                self.config.add_section("tunnel")
+                self.config.set("tunnel", "provider", "cloudflare")
+
+                self.config.add_section("ngrok")
+                self.config.set("ngrok", "auth_token", "<CHANGE_ME_IF_USING_NGROK>")
+            # --------------------------------------------------------------------
+
+            # Ensure sections exist for safety, even if we just created them
+            if not self.config.has_section("aptos"): self.config.add_section("aptos")
+            if not self.config.has_section("host"): self.config.add_section("host")
+
+            # Update the specific values from the user's input
             self.config.set("aptos", "private_key", private_key)
             self.config.set("host", "price_per_second", str(price_per_second))
 
-            # Write to file
+            # Write the complete configuration to the file
             with open(self.config_path, "w", encoding="utf-8") as f:
                 self.config.write(f)
 
@@ -506,15 +571,12 @@ class SettingsDialog(QtWidgets.QDialog):
                 self,
                 "Settings Saved",
                 "Configuration has been saved successfully!\n\n"
-                "Restart the agent for changes to take effect.",
+                "If this is your first time, please edit the new config.ini to set the contract address.",
             )
-
             self.accept()
 
         except Exception as e:
-            QtWidgets.QMessageBox.critical(
-                self, "Save Error", f"Failed to save configuration:\n{str(e)}"
-            )
+            QtWidgets.QMessageBox.critical(self, "Save Error", f"Failed to save configuration:\n{str(e)}")
 
 
 def main():
