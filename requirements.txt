@@ -8,3 +8,5 @@ pyngrok
 pyside6
 fastapi
 uvicorn
+python-dotenv
+platformdirs 

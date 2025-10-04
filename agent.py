@@ -153,19 +153,19 @@ class HostAgent:
       - Handle start/stop_session over WS (by job_id)
     """
 
-    def __init__(self, config: configparser.ConfigParser):
-        # ---- Config ----
+    def __init__(self, config: Dict):
+        # ---- Config is now a simple dictionary ----
         self.config = config
-        self.contract_address = config["aptos"]["contract_address"]
-        self.node_url = config["aptos"]["node_url"]
-        self.price_per_second = int(config["host"]["price_per_second"])
+        self.contract_address = config["aptos_contract_address"]
+        self.node_url = config["aptos_node_url"]
+        self.price_per_second = int(config["price_per_second"])
 
         # ---- Chain client & account ----
         self._rest = RestClient(self.node_url)
-        self._acct = Account.load_key(config["aptos"]["private_key"])
+        self._acct = Account.load_key(config["private_key"])
 
-        # ---- Backend WS base (env overrides constant) ----
-        self.ws_base = os.getenv("BACKEND_WS_URL", DEFAULT_BACKEND_WS_URL)
+        # ---- Backend WS base (from .env) ----
+        self.ws_base = config["backend_ws_url"]
         log.info(f"BACKEND_WS_URL = {self.ws_base}")
         log.info(f"Host address    = {self._acct.address()}")
 
