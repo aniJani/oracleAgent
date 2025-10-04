@@ -1,4 +1,7 @@
 import asyncio
+import contextlib
+import io
+import logging
 import os
 import sys
 import json
@@ -10,7 +13,9 @@ import configparser
 
 import requests  # only used for stats if you keep a separate backend; safe otherwise
 from PySide6 import QtCore, QtWidgets, QtGui
-from main import _register_once, load_config
+from agent import HostAgent
+from main import _register_once, load_config, run_agent_main
+from typing import Dict
 
 # If you already have constants.py with STATE_FILE, import it; else define a temp path
 try:
@@ -77,15 +82,30 @@ class AgentProcess(QtCore.QObject):
     def start(self):
         if self.proc and self.proc.poll() is None:
             return
+        
         self._stop_reader.clear()
+
+        # --- THIS IS THE KEY FIX ---
+        # When running as an .exe, we call the .exe itself with a special flag.
+        # When running as a script, we call 'python main.py'.
+        if getattr(sys, 'frozen', False):
+            # We are in the bundled .exe. Call ourself with the --run-agent flag.
+            command = [sys.executable, "--run-agent"]
+        else:
+            # We are in development. Call the main.py script.
+            command = [sys.executable, "-u", "main.py"]
+        # ---------------------------
+        
         self.proc = subprocess.Popen(
-            [sys.executable, "-u", "main.py"],  # run agent loop
+            command,
             cwd=str(APP_ROOT),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
             universal_newlines=True,
+            # Hide the console window on Windows
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
         )
         self._reader_thread = threading.Thread(target=self._read_stdout, daemon=True)
         self._reader_thread.start()
@@ -118,6 +138,81 @@ class AgentProcess(QtCore.QObject):
         rc = self.proc.wait()
         self.exited.emit(rc)
 
+class QtStream(io.StringIO):
+    """
+    A custom stream object that redirects stdout/stderr to a Qt signal.
+    """
+    def __init__(self, signal_emitter):
+        super().__init__()
+        self.signal_emitter = signal_emitter
+
+    def write(self, text):
+        # Emit the signal with the new text
+        self.signal_emitter.emit(text)
+
+# --- NEW CLASS: A thread to run the agent's asyncio loop ---
+class QtLogHandler(logging.Handler):
+    def __init__(self, signal_emitter):
+        super().__init__()
+        self.signal_emitter = signal_emitter
+
+    def emit(self, record):
+        msg = self.format(record)
+        self.signal_emitter.emit(msg + '\n')
+
+# --- REPLACE the AgentThread class ---
+class AgentThread(QtCore.QObject):
+    """
+    Runs the agent's main asyncio loop in a separate thread.
+    Captures all logging output and communicates back to the GUI using Qt signals.
+    """
+    log_signal = QtCore.Signal(str)
+    finished_signal = QtCore.Signal(int)
+    
+    def __init__(self):
+        super().__init__()
+        self._thread = None
+
+    def start(self):
+        if self._thread and self._thread.is_alive():
+            return
+        self._thread = threading.Thread(target=self.run, daemon=True)
+        self._thread.start()
+
+    def run(self):
+        """
+        The main entry point for the background thread.
+        Sets up the logging system to use a Qt signal handler.
+        """
+        # --- THIS IS THE NEW, ROBUST LOGGING SETUP ---
+        # Get the root logger
+        root_logger = logging.getLogger()
+        # Clear any existing handlers
+        root_logger.handlers.clear()
+        # Set the level to capture everything
+        root_logger.setLevel(logging.INFO)
+        # Create our custom handler that emits a Qt signal
+        qt_handler = QtLogHandler(signal_emitter=self.log_signal)
+        # Add a formatter
+        formatter = logging.Formatter('%(asctime)s | %(levelname)s | %(message)s')
+        qt_handler.setFormatter(formatter)
+        # Add our handler to the root logger
+        root_logger.addHandler(qt_handler)
+        # -----------------------------------------------
+        
+        return_code = 0
+        try:
+            # Now, any logging call from any module (agent, main, etc.)
+            # will be processed by our QtLogHandler.
+            run_agent_main()
+        except Exception:
+            import traceback
+            # Use the logger to report the final crash
+            logging.critical(f"CRITICAL AGENT THREAD ERROR:\n{traceback.format_exc()}")
+            return_code = 1
+        finally:
+            self.finished_signal.emit(return_code)
+
 
 class SimpleMainWindow(QtWidgets.QMainWindow):
     def __init__(self):
@@ -125,9 +220,9 @@ class SimpleMainWindow(QtWidgets.QMainWindow):
         self.setWindowTitle("GPU Rental Host")
         self.resize(1200, 800)
 
-        self.agent = AgentProcess()
-        self.agent.output.connect(self.on_agent_output)
-        self.agent.exited.connect(self.on_agent_exit)
+        self.agent = AgentThread()
+        self.agent.log_signal.connect(self.on_agent_output)
+        self.agent.finished_signal.connect(self.on_agent_exit)
 
         # Layout
         central_widget = QtWidgets.QWidget()
@@ -267,59 +362,72 @@ class SimpleMainWindow(QtWidgets.QMainWindow):
         This function runs in a background thread. It loads the config
         and then executes the async _register_once function.
         """
+        result = None
         try:
-            # First, try to load the config to catch errors early
             load_config() 
-            # asyncio.run() creates a new event loop and runs the task.
             result = asyncio.run(_register_once())
             
-            # Use a signal to safely update the GUI from this background thread
-            QtCore.QMetaObject.invokeMethod(self, "_on_registration_complete", QtCore.Qt.QueuedConnection, QtCore.Q_ARG(dict, result))
+            # Extract simple strings to send over the signal
+            status = result.get("status", "error")
+            message = result.get("message", "Unknown result")
+            
+            QtCore.QMetaObject.invokeMethod(self, "_on_registration_complete", QtCore.Qt.QueuedConnection, 
+                                            QtCore.Q_ARG(str, status), QtCore.Q_ARG(str, message))
         except Exception as e:
-            # Handle errors like a missing or invalid config.ini
-            error_result = {"status": "error", "message": str(e)}
-            QtCore.QMetaObject.invokeMethod(self, "_on_registration_complete", QtCore.Qt.QueuedConnection, QtCore.Q_ARG(dict, error_result))
+            # On failure, also send simple strings
+            status = "error"
+            message = f"An exception occurred in the registration thread: {e}"
+            QtCore.QMetaObject.invokeMethod(self, "_on_registration_complete", QtCore.Qt.QueuedConnection, 
+                                            QtCore.Q_ARG(str, status), QtCore.Q_ARG(str, message))
 
-    @QtCore.Slot(dict, str) # <-- MODIFIED: Accept a string argument for logs
-    def _on_registration_complete(self, result: dict, logs: str):
+    # --- REPLACE this function ---
+    @QtCore.Slot(str, str) # <-- MODIFIED: Now accepts two strings
+    def _on_registration_complete(self, status: str, message: str):
         """
         This function is a Qt Slot. It is safely called on the main GUI thread
-        to update the UI with the result and logs of the registration task.
+        to update the UI with the result of the registration task.
         """
-        # --- ADDED: Log the captured output ---
-        if logs:
-            self.log.appendPlainText("--- Registration Sub-process Output ---")
-            self.log.appendPlainText(logs.strip())
-            self.log.appendPlainText("------------------------------------")
-        # ----------------------------------------
-        
-        if result and result.get("status") == "ok":
-            # The print() from main.py is already in the logs, so just add a summary
-            self.log.appendPlainText(f"✅ Registration process completed successfully.")
+        if status == "ok":
+            self.log.appendPlainText(f"✅ Registration successful: {message}")
             # Keep the button disabled if it succeeded.
         else:
-            # The error from main.py is already in the logs, just add a summary
-            self.log.appendPlainText(f"❌ Registration process failed. See output above for details.")
+            self.log.appendPlainText(f"❌ Registration failed: {message}")
             self.btn_register.setEnabled(True) # Re-enable the button on failure.
+            
+    def on_register(self):
+        """
+        Handles the 'Register' button click by starting the registration
+        process in a background thread to keep the GUI responsive.
+        """
+        self.log.appendPlainText("Attempting to register device on-chain...")
+        self.btn_register.setEnabled(False)  # Disable button during operation
+
+        # Run the async registration function in a separate thread.
+        thread = threading.Thread(target=self._run_registration_task, daemon=True)
+        thread.start()
 
     def on_start(self):
         self.log.clear()
-        self.log.appendPlainText("Attempting to start agent...")
-        self.agent.start()
+        self.log.appendPlainText("Attempting to start agent in a background thread...")
+        self.agent.start() # <-- MODIFIED: This now starts the thread
+        
         self.btn_start.setEnabled(False)
         self.btn_stop.setEnabled(True)
         self.status_label.setText("Online")
-        self.status_indicator.setStyleSheet(
-            "background-color: qradialgradient(cx: 0.5, cy: 0.5, radius: 0.5, fx: 0.5, fy: 0.5, "
-            "stop: 0 #50fa7b, stop: 0.5 #28a745, stop: 1 #1a1b26);"
-        )
+        self.status_indicator.setStyleSheet("background-color: qradialgradient(cx: 0.5, cy: 0.5, radius: 0.5, fx: 0.5, fy: 0.5, stop: 0 #50fa7b, stop: 0.5 #28a745, stop: 1 #1a1b26);")
         self.setWindowTitle("GPU Rental Host - Online")
-        # self.timer.start()
 
     def on_stop(self):
-        self.agent.stop()
-        self.update_ui_for_stop()
-        self.log.appendPlainText("\nAgent has been stopped.")
+        self.log.appendPlainText("\nStopping agent by closing the application...")
+        # A confirmation dialog is good UX
+        reply = QtWidgets.QMessageBox.question(self, 'Confirm Stop', 
+                                               "This will stop the agent and close the application. Are you sure?",
+                                               QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No, 
+                                               QtWidgets.QMessageBox.No)
+        if reply == QtWidgets.QMessageBox.Yes:
+            self.close()
+        else:
+            self.log.appendPlainText("Stop cancelled.")
 
     def on_settings(self):
         """Open the settings dialog"""
@@ -369,11 +477,14 @@ class SimpleMainWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
 
-    def on_agent_output(self, line: str):
-        self.log.appendPlainText(line)
+    @QtCore.Slot(str)
+    def on_agent_output(self, text: str):
+        self.log.moveCursor(QtGui.QTextCursor.End)
+        self.log.insertPlainText(text)
 
-    def on_agent_exit(self, rc: int):
-        self.log.appendPlainText(f"\nAgent process exited with code {rc}.")
+    @QtCore.Slot(int)
+    def on_agent_exit(self, return_code: int):
+        self.log.appendPlainText(f"\nAgent process finished with code {return_code}.")
         self.update_ui_for_stop()
 
 
@@ -542,8 +653,9 @@ class SettingsDialog(QtWidgets.QDialog):
             if not self.config_path.exists():
                 self.config = configparser.ConfigParser()
                 self.config.add_section("aptos")
-                self.config.set("aptos", "contract_address", "<CHANGE_ME_CONTRACT_ADDRESS>")
-                self.config.set("aptos", "node_url", "https://fullnode.mainnet.aptoslabs.com/v1")
+                # Use the provided testnet defaults
+                self.config.set("aptos", "contract_address", "0xc6cb811e72af6ce5036b2d8812536ce2fd6213a403a892a8b6b7154443da19ba")
+                self.config.set("aptos", "node_url", "https://fullnode.testnet.aptoslabs.com/v1")
                 self.config.set("aptos", "backend_ws_url", "ws://127.0.0.1:8000/ws")
                 
                 self.config.add_section("host")
@@ -552,7 +664,7 @@ class SettingsDialog(QtWidgets.QDialog):
                 self.config.set("tunnel", "provider", "cloudflare")
 
                 self.config.add_section("ngrok")
-                self.config.set("ngrok", "auth_token", "<CHANGE_ME_IF_USING_NGROK>")
+                self.config.set("ngrok", "auth_token", "<ENTER_NGROK_TOKEN_IF_USING_NGROK>")
             # --------------------------------------------------------------------
 
             # Ensure sections exist for safety, even if we just created them

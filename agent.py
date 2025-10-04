@@ -45,9 +45,9 @@ except Exception:
     CONTAINER_NAME_PREFIX = "uc-job-"
 
 log = logging.getLogger("host-agent")
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s"
-)
+# logging.basicConfig(
+#     level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s"
+# )
 
 
 # ---------------------------- utilities ----------------------------

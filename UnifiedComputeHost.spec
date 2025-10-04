@@ -1,11 +1,15 @@
 # -*- mode: python ; coding: utf-8 -*-
+from PyInstaller.utils.hooks import copy_metadata
+
+datas = []
+datas += copy_metadata('aptos-sdk')
 
 
 a = Analysis(
     ['gui_app.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=datas,
     hiddenimports=['cffi', '_cffi_backend', 'nacl.bindings'],
     hookspath=[],
     hooksconfig={},
@@ -29,7 +33,7 @@ exe = EXE(
     upx=True,
     upx_exclude=[],
     runtime_tmpdir=None,
-    console=True,
+    console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
