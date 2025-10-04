@@ -10,12 +10,16 @@ import threading
 import time
 from pathlib import Path
 import configparser
+import webbrowser
 
 import requests  # only used for stats if you keep a separate backend; safe otherwise
 from PySide6 import QtCore, QtWidgets, QtGui
 from agent import HostAgent
 from main import _register_once, load_config, run_agent_main
 from typing import Dict
+from config import save_user_settings, load_user_settings
+from system_utils import attempt_install_cloudflared, is_docker_running
+from system_utils import run_preflight_checks
 
 # If you already have constants.py with STATE_FILE, import it; else define a temp path
 try:
@@ -31,7 +35,7 @@ else:
 # If you have a separate backend for listings/sessions, you can point to it here.
 # The GUI no longer needs a local uvicorn control API.
 BACKEND_BASE = os.getenv(
-    "UC_BACKEND_BASE", "http://127.0.0.1:8000"
+    "UC_BACKEND_BASE", "https://axessprotocolbackend-production.up.railway.app"
 ).strip()  # e.g.,  (optional)
 
 MODERN_STYLESHEET = """
@@ -217,7 +221,7 @@ class AgentThread(QtCore.QObject):
 class SimpleMainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("GPU Rental Host")
+        self.setWindowTitle("Axess Protocol Agent")
         self.resize(1200, 800)
 
         self.agent = AgentThread()
@@ -329,6 +333,113 @@ class SimpleMainWindow(QtWidgets.QMainWindow):
 
         # Initial UI state
         self.update_ui_for_stop()
+        QtCore.QTimer.singleShot(500, self.perform_startup_checks)
+    
+    def perform_startup_checks(self):
+        """
+        Runs pre-flight checks and displays a custom message box with
+        install options if there are any issues.
+        """
+        errors = run_preflight_checks()
+        
+        if not errors:
+            self.log.appendPlainText("✅ All prerequisite checks passed.")
+            return
+        
+        install_cf_button = None
+        open_nvidia_button = None # <-- ADD
+        
+        if any("Cloudflare" in e for e in errors):
+            install_cf_button = msg_box.addButton("Install Cloudflared", QtWidgets.QMessageBox.ActionRole)
+        
+        if any("NVIDIA" in e for e in errors): # <-- ADD THIS BLOCK
+            open_nvidia_button = msg_box.addButton("Go to NVIDIA Drivers", QtWidgets.QMessageBox.ActionRole)
+
+        # Execute the dialog
+        msg_box.exec()
+
+        # Handle custom button clicks
+        clicked_button = msg_box.clickedButton()
+        if clicked_button == install_cf_button:
+            self.run_cloudflared_installation()
+        elif clicked_button == open_nvidia_button: # <-- ADD THIS BLOCK
+            self.log.appendPlainText("Opening NVIDIA driver download page in browser...")
+            webbrowser.open("https://www.nvidia.com/Download/index.aspx")
+
+        # Disable buttons until resolved
+        self.btn_start.setEnabled(False)
+        self.btn_register.setEnabled(False)
+        self.btn_start.setToolTip("Prerequisites missing. See message.")
+        self.btn_register.setToolTip("Prerequisites missing. See message.")
+
+        # --- NEW CUSTOM MESSAGE BOX LOGIC ---
+        msg_box = QtWidgets.QMessageBox(self)
+        msg_box.setIcon(QtWidgets.QMessageBox.Critical)
+        msg_box.setWindowTitle("Prerequisites Check Failed")
+        msg_box.setText("Some required software is missing or not configured correctly.")
+        
+        error_summary = "\n\n".join(errors)
+        msg_box.setInformativeText(error_summary)
+
+        # Add standard buttons
+        msg_box.setStandardButtons(QtWidgets.QMessageBox.Close)
+        
+        # Add custom buttons for actionable errors
+        install_cf_button = None
+        if any("Cloudflare" in e for e in errors):
+            install_cf_button = msg_box.addButton("Install Cloudflared", QtWidgets.QMessageBox.ActionRole)
+
+        # Execute the dialog
+        msg_box.exec()
+
+        # Handle custom button clicks
+        clicked_button = msg_box.clickedButton()
+        if clicked_button == install_cf_button:
+            self.run_cloudflared_installation()
+        # ------------------------------------
+
+        self.log.appendPlainText("--- PREREQUISITE CHECKS FAILED ---")
+        for error in errors: self.log.appendPlainText(error)
+        self.log.appendPlainText("------------------------------------")
+
+
+
+    # --- ADD THIS NEW METHOD to handle the installation ---
+    def run_cloudflared_installation(self):
+        self.log.appendPlainText("User initiated 'cloudflared' installation...")
+        # Show a "please wait" message as this can take time
+        progress_dialog = QtWidgets.QProgressDialog("Installing cloudflared...", "Cancel", 0, 0, self)
+        progress_dialog.setWindowModality(QtCore.Qt.WindowModal)
+        progress_dialog.setWindowTitle("Installation in Progress")
+        progress_dialog.show()
+        
+        # We must run the installation in a thread to avoid freezing the GUI
+        def install_task():
+            success, message = attempt_install_cloudflared()
+            # Safely update the GUI from the thread
+            QtCore.QMetaObject.invokeMethod(self, "_on_installation_complete", QtCore.Qt.QueuedConnection, 
+                                            QtCore.Q_ARG(bool, success), QtCore.Q_ARG(str, message))
+
+        # Start the installation thread
+        thread = threading.Thread(target=install_task, daemon=True)
+        thread.start()
+
+    # --- ADD THIS NEW SLOT to handle completion ---
+    @QtCore.Slot(bool, str)
+    def _on_installation_complete(self, success: bool, message: str):
+        # The progress dialog is no longer needed, find and close it.
+        for widget in QtWidgets.QApplication.allWidgets():
+            if isinstance(widget, QtWidgets.QProgressDialog):
+                widget.close()
+
+        if success:
+            QtWidgets.QMessageBox.information(self, "Installation Successful", message)
+            self.log.appendPlainText(f"✅ {message}")
+            # Prompt the user to re-check
+            self.log.appendPlainText("Please restart the application to re-run the prerequisite checks.")
+        else:
+            QtWidgets.QMessageBox.critical(self, "Installation Failed", message)
+            self.log.appendPlainText(f"❌ {message}")
 
     # ---------- Actions ----------
     async def _register_once() -> Dict:
@@ -407,15 +518,37 @@ class SimpleMainWindow(QtWidgets.QMainWindow):
         thread.start()
 
     def on_start(self):
-        self.log.clear()
-        self.log.appendPlainText("Attempting to start agent in a background thread...")
-        self.agent.start() # <-- MODIFIED: This now starts the thread
+        self.log.appendPlainText("Checking Docker status...")
+        
+        # --- THIS IS THE NEW LOGIC ---
+        if not is_docker_running():
+            self.log.appendPlainText("❌ Docker is not running. Agent cannot start.")
+            
+            # Show a user-friendly error message box
+            msg_box = QtWidgets.QMessageBox(self)
+            msg_box.setIcon(QtWidgets.QMessageBox.Warning)
+            msg_box.setWindowTitle("Docker Not Found")
+            msg_box.setText("The Docker daemon is not running.")
+            msg_box.setInformativeText(
+                "Please start Docker Desktop and wait for it to be fully initialized before starting the agent."
+            )
+            msg_box.setStandardButtons(QtWidgets.QMessageBox.Ok)
+            msg_box.exec()
+            
+            # Abort the start process
+            return
+        # ---------------------------
+
+        self.log.appendPlainText("✅ Docker is running. Starting agent in a background thread...")
+        
+        # This part is the same as before
+        self.agent.start()
         
         self.btn_start.setEnabled(False)
         self.btn_stop.setEnabled(True)
         self.status_label.setText("Online")
         self.status_indicator.setStyleSheet("background-color: qradialgradient(cx: 0.5, cy: 0.5, radius: 0.5, fx: 0.5, fy: 0.5, stop: 0 #50fa7b, stop: 0.5 #28a745, stop: 1 #1a1b26);")
-        self.setWindowTitle("GPU Rental Host - Online")
+        self.setWindowTitle("Axess Protocol Agent - Online")
 
     def on_stop(self):
         self.log.appendPlainText("\nStopping agent by closing the application...")
@@ -458,7 +591,7 @@ class SimpleMainWindow(QtWidgets.QMainWindow):
             "background-color: qradialgradient(cx: 0.5, cy: 0.5, radius: 0.5, fx: 0.5, fy: 0.5, "
             "stop: 0 #ff5555, stop: 0.5 #dc3545, stop: 1 #1a1b26);"
         )
-        self.setWindowTitle("GPU Rental Host - Offline")
+        self.setWindowTitle("Axess Protocol Agent - Offline")
         self.sessions_label.setText("Active Sessions: 0")
         if self.timer.isActive():
             self.timer.stop()
@@ -495,11 +628,10 @@ class SettingsDialog(QtWidgets.QDialog):
         self.setModal(True)
         self.setFixedSize(500, 300)
 
-        # Load current config
-        self.config_path = APP_ROOT / "config.ini"
-        self.config = configparser.ConfigParser()
-        self.load_current_config()
-
+        # --- MODIFIED: Use the new loader ---
+        self.config = load_user_settings()
+        # ------------------------------------
+        
         self.setup_ui()
         self.load_values()
 
@@ -586,26 +718,6 @@ class SettingsDialog(QtWidgets.QDialog):
                 self, "Config Error", f"Error loading config: {e}"
             )
 
-    def load_values(self):
-        """Load current values into the form"""
-        try:
-            # Load private key
-            if self.config.has_option("aptos", "private_key"):
-                private_key = self.config.get("aptos", "private_key")
-                self.private_key_edit.setText(private_key)
-
-            # Load price per second
-            if self.config.has_option("host", "price_per_second"):
-                price = self.config.getint("host", "price_per_second")
-                self.price_edit.setValue(price)
-            else:
-                self.price_edit.setValue(1)  # Default value
-
-        except Exception as e:
-            QtWidgets.QMessageBox.warning(
-                self, "Load Error", f"Error loading values: {e}"
-            )
-
     def toggle_password_visibility(self):
         """Toggle password visibility for private key field"""
         if self.show_key_btn.isChecked():
@@ -633,60 +745,38 @@ class SettingsDialog(QtWidgets.QDialog):
 
         return True, ""
 
+    def load_values(self):
+        """Load current values into the form."""
+        private_key = self.config.get("aptos", "private_key", fallback="")
+        self.private_key_edit.setText(private_key)
+        
+        price = self.config.getint("host", "price_per_second", fallback=1)
+        self.price_edit.setValue(price)
+        
+    # --- THIS METHOD IS NOW MUCH SIMPLER ---
     def save_config(self):
         """
-        Validates user input and saves it to config.ini.
-        Creates a new, complete config.ini file if one does not exist.
+        Validates user input and saves it using the centralized config helper.
         """
         try:
-            # Get values from form
             private_key = self.private_key_edit.text().strip()
             price_per_second = self.price_edit.value()
 
-            # Validate private key
             is_valid, error_msg = self.validate_private_key(private_key)
             if not is_valid:
                 QtWidgets.QMessageBox.warning(self, "Validation Error", error_msg)
                 return
-
-            # --- NEW LOGIC: Create a full default config if the file is missing ---
-            if not self.config_path.exists():
-                self.config = configparser.ConfigParser()
-                self.config.add_section("aptos")
-                # Use the provided testnet defaults
-                self.config.set("aptos", "contract_address", "0xc6cb811e72af6ce5036b2d8812536ce2fd6213a403a892a8b6b7154443da19ba")
-                self.config.set("aptos", "node_url", "https://fullnode.testnet.aptoslabs.com/v1")
-                self.config.set("aptos", "backend_ws_url", "ws://127.0.0.1:8000/ws")
-                
-                self.config.add_section("host")
-
-                self.config.add_section("tunnel")
-                self.config.set("tunnel", "provider", "cloudflare")
-
-                self.config.add_section("ngrok")
-                self.config.set("ngrok", "auth_token", "<ENTER_NGROK_TOKEN_IF_USING_NGROK>")
-            # --------------------------------------------------------------------
-
-            # Ensure sections exist for safety, even if we just created them
-            if not self.config.has_section("aptos"): self.config.add_section("aptos")
-            if not self.config.has_section("host"): self.config.add_section("host")
-
-            # Update the specific values from the user's input
-            self.config.set("aptos", "private_key", private_key)
-            self.config.set("host", "price_per_second", str(price_per_second))
-
-            # Write the complete configuration to the file
-            with open(self.config_path, "w", encoding="utf-8") as f:
-                self.config.write(f)
+            
+            # --- MODIFIED: Use the new save function ---
+            save_user_settings(private_key, price_per_second)
+            # -------------------------------------------
 
             QtWidgets.QMessageBox.information(
                 self,
                 "Settings Saved",
-                "Configuration has been saved successfully!\n\n"
-                "If this is your first time, please edit the new config.ini to set the contract address.",
+                "Your settings have been saved successfully!"
             )
             self.accept()
-
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Save Error", f"Failed to save configuration:\n{str(e)}")
 

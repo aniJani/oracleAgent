@@ -20,8 +20,7 @@ try:
 except Exception:
     _PREFIX = "uc-job-"
 
-SESSIONS_ROOT = Path(os.getenv("SESSIONS_ROOT", "./sessions")).resolve()
-SESSIONS_ROOT.mkdir(parents=True, exist_ok=True)
+from config import SESSIONS_DIR as SESSIONS_ROOT
 
 DOCKER_BIN = os.environ.get("DOCKER_BIN", "docker")
 

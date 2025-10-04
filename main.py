@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import configparser
 import logging
+import os
 from pathlib import Path
 import sys
 import time
@@ -11,31 +12,10 @@ from typing import Dict
 
 from agent import HostAgent
 import agent
+from config import load_all_settings as load_config
+from dotenv import load_dotenv
 
-# Note: The logging config is now inside the functions
-# to prevent it from running on simple import.
-
-def load_config() -> configparser.ConfigParser:
-    cfg = configparser.ConfigParser()
-    try:
-        # Correctly locate config.ini next to the executable
-        if getattr(sys, 'frozen', False):
-            config_path = Path(sys.executable).parent / "config.ini"
-        else:
-            config_path = Path(__file__).resolve().parent / "config.ini"
-
-        with open(config_path, "r", encoding="utf-8") as f:
-            cfg.read_file(f)
-        _ = cfg["aptos"]["private_key"]
-        _ = cfg["aptos"]["contract_address"]
-        _ = cfg["aptos"]["node_url"]
-        _ = cfg["host"]["price_per_second"]
-        return cfg
-    except (KeyError, FileNotFoundError) as e:
-        # Use logging that will be visible in the GUI console
-        logging.error(f"Configuration error in 'config.ini': {e}")
-        # Raising an exception is better than sys.exit() for library use
-        raise ValueError(f"Configuration error in 'config.ini': {e}") from e
+load_dotenv()
 
 async def _run_agent_async():
     cfg = load_config()

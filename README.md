@@ -73,6 +73,26 @@ Create a single EXE for Windows:
 ```powershell
 pip install pyinstaller
 pyinstaller --noconfirm --onefile --name UnifiedComputeHost gui_app.py
+
+Windows
+pyinstaller --noconfirm --onefile --name "Axess Protocol Agent" `
+--windowed `
+--icon="icon.ico" `
+--hidden-import="cffi" `
+--hidden-import="_cffi_backend" `
+--hidden-import="nacl.bindings" `
+--copy-metadata="aptos-sdk" `
+--add-data=".env;." `
+gui_app.py
+
+Mac
+pyinstaller --noconfirm --onefile --name UnifiedComputeHost \
+--windowed \
+--hidden-import="cffi" \
+--hidden-import="_cffi_backend" \
+--hidden-import="nacl.bindings" \
+--copy-metadata="aptos-sdk" \
+gui_app.py
 ```
 
 ## Troubleshooting
